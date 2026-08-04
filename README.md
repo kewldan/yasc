@@ -7,6 +7,7 @@ currently in its **0.1 local foundation** stage.
 
 - 🖥️ Direct SSH from desktop and CLI without a cloud account
 - 🔑 Explicit credential custody, synchronization, and usage grants
+- 🧰 Application-level encrypted local vault with Argon2id unlock and authenticated envelopes
 - 🧭 Connection inspection with safe, redacted diagnostics
 - 🗂️ Host inventory, OpenSSH compatibility, tunnels, SFTP, and workspace restore
 - 🌐 Optional private synchronization, teams, gateway access, automation, and staged RDP support
@@ -41,6 +42,8 @@ cargo run -p yasc-cli -- --database ./yasc.db host add production admin@example.
   --tag linux --tag production --environment production
 cargo run -p yasc-cli -- --database ./yasc.db host list
 ```
+
+The same format, lint, and test gates run on Linux, macOS, and Windows in GitHub Actions.
 
 Without `--database`, the CLI stores inventory in the operating system's application-data
 directory. Host records contain connection metadata only; credential plaintext belongs exclusively

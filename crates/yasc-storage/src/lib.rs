@@ -7,8 +7,12 @@ use std::{collections::BTreeSet, path::Path, str::FromStr, time::Duration};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
 use yasc_domain::{Host, HostError, HostId, SshTarget, TargetParseError};
+use yasc_vault::{
+    SecretKind, StoredSecretEnvelope, StoredVaultHeader, VaultKdfParams, VaultStore,
+    VaultStoreError,
+};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 struct Migration {
     version: u32,
@@ -16,10 +20,11 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "local_host_inventory",
-    sql: r#"
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "local_host_inventory",
+        sql: r#"
         CREATE TABLE hosts (
             id                  TEXT PRIMARY KEY NOT NULL,
             label               TEXT NOT NULL CHECK (length(trim(label)) > 0),
@@ -44,12 +49,198 @@ const MIGRATIONS: &[Migration] = &[Migration {
         );
 
         CREATE INDEX host_tags_tag_idx ON host_tags(tag, host_id);
-    "#,
-}];
+        "#,
+    },
+    Migration {
+        version: 2,
+        name: "encrypted_local_vault",
+        sql: r#"
+            CREATE TABLE vault_header (
+                singleton               INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+                format_version          INTEGER NOT NULL CHECK (format_version > 0),
+                kdf_memory_kib          INTEGER NOT NULL CHECK (kdf_memory_kib > 0),
+                kdf_iterations          INTEGER NOT NULL CHECK (kdf_iterations > 0),
+                kdf_parallelism         INTEGER NOT NULL CHECK (kdf_parallelism > 0),
+                salt                    BLOB NOT NULL,
+                verifier_nonce          BLOB NOT NULL,
+                verifier_ciphertext     BLOB NOT NULL,
+                revision                INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+                created_at_unix         INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at_unix         INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
+            CREATE TABLE vault_secrets (
+                id                      TEXT PRIMARY KEY NOT NULL,
+                credential_id           TEXT NOT NULL,
+                kind                    INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 255),
+                format_version          INTEGER NOT NULL CHECK (format_version > 0),
+                key_version             INTEGER NOT NULL CHECK (key_version > 0),
+                nonce                   BLOB NOT NULL,
+                ciphertext              BLOB NOT NULL,
+                revision                INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+                created_at_unix         INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at_unix         INTEGER NOT NULL DEFAULT (unixepoch()),
+                deleted_at_unix         INTEGER
+            );
+
+            CREATE INDEX vault_secrets_credential_idx
+                ON vault_secrets(credential_id, kind)
+                WHERE deleted_at_unix IS NULL;
+        "#,
+    },
+];
 
 /// SQLite-backed local state. Secret material is owned by `yasc-vault`, not this repository.
 pub struct SqliteStorage {
     connection: Connection,
+}
+
+impl VaultStore for SqliteStorage {
+    fn load_vault_header(&self) -> Result<Option<StoredVaultHeader>, VaultStoreError> {
+        self.connection
+            .query_row(
+                r#"
+                    SELECT format_version, kdf_memory_kib, kdf_iterations, kdf_parallelism,
+                           salt, verifier_nonce, verifier_ciphertext
+                    FROM vault_header
+                    WHERE singleton = 1
+                "#,
+                [],
+                |row| {
+                    Ok(StoredVaultHeader {
+                        format_version: row.get(0)?,
+                        kdf: VaultKdfParams {
+                            memory_kib: row.get(1)?,
+                            iterations: row.get(2)?,
+                            parallelism: row.get(3)?,
+                        },
+                        salt: row.get(4)?,
+                        verifier_nonce: row.get(5)?,
+                        verifier_ciphertext: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|_| VaultStoreError)
+    }
+
+    fn save_vault_header(&mut self, header: &StoredVaultHeader) -> Result<(), VaultStoreError> {
+        self.connection
+            .execute(
+                r#"
+                    INSERT INTO vault_header (
+                        singleton, format_version, kdf_memory_kib, kdf_iterations,
+                        kdf_parallelism, salt, verifier_nonce, verifier_ciphertext
+                    ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    header.format_version,
+                    header.kdf.memory_kib,
+                    header.kdf.iterations,
+                    header.kdf.parallelism,
+                    header.salt,
+                    header.verifier_nonce,
+                    header.verifier_ciphertext,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|_| VaultStoreError)
+    }
+
+    fn load_secret_envelope(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<StoredSecretEnvelope>, VaultStoreError> {
+        self.connection
+            .query_row(
+                r#"
+                    SELECT id, credential_id, kind, format_version, key_version, nonce, ciphertext
+                    FROM vault_secrets
+                    WHERE id = ?1 AND deleted_at_unix IS NULL
+                "#,
+                [id.to_string()],
+                |row| {
+                    let id = row
+                        .get::<_, String>(0)?
+                        .parse()
+                        .map_err(|error| sql_conversion_error(0, error))?;
+                    let credential_id = row
+                        .get::<_, String>(1)?
+                        .parse::<uuid::Uuid>()
+                        .map(yasc_domain::CredentialId::from_uuid)
+                        .map_err(|error| sql_conversion_error(1, error))?;
+                    let kind_code = row.get::<_, u8>(2)?;
+                    let kind = SecretKind::from_code(kind_code).ok_or_else(|| {
+                        sql_conversion_error(
+                            2,
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "unknown secret kind",
+                            ),
+                        )
+                    })?;
+                    Ok(StoredSecretEnvelope {
+                        id,
+                        credential_id,
+                        kind,
+                        format_version: row.get(3)?,
+                        key_version: row.get(4)?,
+                        nonce: row.get(5)?,
+                        ciphertext: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|_| VaultStoreError)
+    }
+
+    fn save_secret_envelope(
+        &mut self,
+        envelope: &StoredSecretEnvelope,
+    ) -> Result<(), VaultStoreError> {
+        self.connection
+            .execute(
+                r#"
+                    INSERT INTO vault_secrets (
+                        id, credential_id, kind, format_version, key_version, nonce, ciphertext
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    envelope.id.to_string(),
+                    envelope.credential_id.to_string(),
+                    envelope.kind.code(),
+                    envelope.format_version,
+                    envelope.key_version,
+                    envelope.nonce,
+                    envelope.ciphertext,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|_| VaultStoreError)
+    }
+
+    fn tombstone_secret(&mut self, id: uuid::Uuid) -> Result<bool, VaultStoreError> {
+        self.connection
+            .execute(
+                r#"
+                    UPDATE vault_secrets
+                    SET deleted_at_unix = unixepoch(),
+                        updated_at_unix = unixepoch(),
+                        revision = revision + 1
+                    WHERE id = ?1 AND deleted_at_unix IS NULL
+                "#,
+                [id.to_string()],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|_| VaultStoreError)
+    }
+}
+
+fn sql_conversion_error(
+    column: usize,
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(error))
 }
 
 impl SqliteStorage {
@@ -276,6 +467,10 @@ pub enum StorageError {
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
+    use yasc_domain::CredentialId;
+    use yasc_vault::{
+        EncryptedVault, SecretBytes, SecretKind, VaultBackend, VaultError, VaultState,
+    };
 
     use super::*;
 
@@ -349,5 +544,52 @@ mod tests {
             storage.migrate(),
             Err(StorageError::NewerSchema { .. })
         ));
+    }
+
+    #[test]
+    fn encrypted_vault_persists_without_plaintext_and_reopens() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("vault.db");
+        let password = b"local test password";
+        let plaintext = b"never store this private value";
+        let storage = SqliteStorage::open(&path).unwrap();
+        let mut vault =
+            EncryptedVault::create(storage, SecretBytes::new(password.to_vec())).unwrap();
+        let reference = vault
+            .store(
+                CredentialId::new(),
+                SecretKind::Password,
+                SecretBytes::new(plaintext.to_vec()),
+            )
+            .unwrap();
+        let storage = vault.into_store();
+        let ciphertext: Vec<u8> = storage
+            .connection
+            .query_row(
+                "SELECT ciphertext FROM vault_secrets WHERE id = ?1",
+                [reference.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !ciphertext
+                .windows(plaintext.len())
+                .any(|window| window == plaintext)
+        );
+        drop(storage);
+
+        let storage = SqliteStorage::open(&path).unwrap();
+        let mut reopened = EncryptedVault::open(storage).unwrap();
+        assert_eq!(reopened.state(), VaultState::Locked);
+        assert_eq!(
+            reopened
+                .unlock(SecretBytes::new(b"wrong password".to_vec()))
+                .unwrap_err(),
+            VaultError::InvalidUnlockMaterial
+        );
+        reopened
+            .unlock(SecretBytes::new(password.to_vec()))
+            .unwrap();
+        assert_eq!(reopened.read(reference).unwrap().expose_secret(), plaintext);
     }
 }

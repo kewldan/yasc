@@ -8,7 +8,7 @@ recorded in `schema_migrations`, and mirrored to SQLite's `user_version`.
 - Updates increase a monotonic per-row revision.
 - Foreign keys are enabled on every connection.
 - Credential plaintext is never owned by this crate.
+- Vault rows contain versioned KDF metadata, nonces, and authenticated ciphertext only.
 
 Rollback means restoring a compatible backup and application version. Down-migrations are not run
 automatically because lossy schema reversal can silently destroy security metadata.
-
