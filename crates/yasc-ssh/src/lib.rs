@@ -91,10 +91,11 @@ impl OpenSshRequest {
             arguments.push(OsString::from("-G"));
         }
         arguments.push(OsString::from("-F"));
-        arguments.push(self.config_file.as_deref().map_or_else(
-            || OsString::from("none"),
-            |path| path.as_os_str().to_os_string(),
-        ));
+        arguments.push(
+            self.config_file
+                .as_deref()
+                .map_or_else(default_empty_config, |path| path.as_os_str().to_os_string()),
+        );
         arguments.push(OsString::from("-o"));
         arguments.push(OsString::from(match self.host_key_policy {
             HostKeyPolicy::Strict => "StrictHostKeyChecking=yes",
@@ -118,6 +119,16 @@ impl OpenSshRequest {
         arguments.push(OsString::from(self.target.host()));
         arguments
     }
+}
+
+#[cfg(windows)]
+fn default_empty_config() -> OsString {
+    OsString::from("NUL")
+}
+
+#[cfg(not(windows))]
+fn default_empty_config() -> OsString {
+    OsString::from("none")
 }
 
 #[derive(Debug, Clone)]
@@ -194,7 +205,12 @@ fn controlled_environment() -> Vec<(OsString, OsString)> {
         "LANG",
         "SSH_AUTH_SOCK",
         "USERPROFILE",
+        "USERNAME",
+        "HOMEDRIVE",
+        "HOMEPATH",
         "SYSTEMROOT",
+        "WINDIR",
+        "PROGRAMDATA",
         "COMSPEC",
         "TEMP",
         "TMP",
