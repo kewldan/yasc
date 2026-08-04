@@ -157,7 +157,7 @@ impl OpenSshEngine {
         let output = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .output()
             .map_err(|source| OpenSshError::Launch {
                 operation: "effective-config",
@@ -167,6 +167,7 @@ impl OpenSshEngine {
             return Err(OpenSshError::CommandFailed {
                 operation: "effective-config",
                 status: output.status.code(),
+                diagnostic: safe_diagnostic(&output.stderr),
             });
         }
         let stdout = String::from_utf8(output.stdout).map_err(|_| OpenSshError::NonUtf8Output)?;
@@ -224,6 +225,31 @@ fn controlled_environment() -> Vec<(OsString, OsString)> {
             ALLOWED.iter().any(|allowed| key == *allowed) || key.starts_with("LC_")
         })
         .collect()
+}
+
+fn safe_diagnostic(stderr: &[u8]) -> String {
+    const MAX_DIAGNOSTIC_CHARS: usize = 1024;
+    let mut lines = String::from_utf8_lossy(stderr)
+        .lines()
+        .map(|line| {
+            let lowercase = line.to_ascii_lowercase();
+            if ["proxycommand", "localcommand", "remotecommand", "setenv"]
+                .iter()
+                .any(|key| lowercase.contains(key))
+            {
+                "[REDACTED OPENSSH CONFIG ERROR]".to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    for variable in ["HOME", "USERPROFILE"] {
+        if let Some(home) = env::var_os(variable) {
+            lines = lines.replace(&home.to_string_lossy().into_owned(), "~");
+        }
+    }
+    lines.chars().take(MAX_DIAGNOSTIC_CHARS).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,10 +335,11 @@ pub enum OpenSshError {
         #[source]
         source: std::io::Error,
     },
-    #[error("OpenSSH {operation} failed with exit code {status:?}")]
+    #[error("OpenSSH {operation} failed with exit code {status:?}: {diagnostic}")]
     CommandFailed {
         operation: &'static str,
         status: Option<i32>,
+        diagnostic: String,
     },
     #[error("OpenSSH produced non-UTF-8 effective configuration")]
     NonUtf8Output,
@@ -371,6 +398,17 @@ mod tests {
             .unwrap();
         assert_eq!(proxy.value, "[REDACTED]");
         assert!(proxy.redacted);
+    }
+
+    #[test]
+    fn diagnostics_redact_commands_and_home_directory() {
+        let home = env::var("HOME").unwrap_or_default();
+        let stderr = format!("{home}/.ssh/config: ProxyCommand token=secret");
+
+        let diagnostic = safe_diagnostic(stderr.as_bytes());
+
+        assert!(!diagnostic.contains("token=secret"));
+        assert!(!home.is_empty() || !diagnostic.contains(&home));
     }
 
     #[test]
