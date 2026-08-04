@@ -26,8 +26,7 @@ use yasc_platform::{PlatformError, PlatformPaths};
 use yasc_ssh::{
     NativeAgentSftpRequest, NativeAgentShellRequest, NativeHostKeyProbe, NativeSftpSession,
     NativeShellIo, NativeSshEngine, NativeSshError, SftpEntry, SftpUploadResult, TerminalSize,
-    connect_agent, external_key_fingerprint,
-    list_agent_identities as query_agent_identities,
+    connect_agent, external_key_fingerprint, list_agent_identities as query_agent_identities,
 };
 use yasc_storage::{PersistedCredential, SqliteStorage, StorageError};
 
