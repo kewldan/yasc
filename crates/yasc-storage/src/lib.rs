@@ -340,6 +340,49 @@ fn sql_conversion_error(
     rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(error))
 }
 
+fn save_host_in_transaction(
+    transaction: &Transaction<'_>,
+    host: &Host,
+) -> Result<(), StorageError> {
+    transaction.execute(
+        r#"
+            INSERT INTO hosts (
+                id, label, hostname, port, port_explicit, username, environment
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(id) DO UPDATE SET
+                label = excluded.label,
+                hostname = excluded.hostname,
+                port = excluded.port,
+                port_explicit = excluded.port_explicit,
+                username = excluded.username,
+                environment = excluded.environment,
+                revision = hosts.revision + 1,
+                updated_at_unix = unixepoch(),
+                deleted_at_unix = NULL
+        "#,
+        params![
+            host.id.to_string(),
+            host.label,
+            host.target.host(),
+            host.target.port(),
+            host.target.port_is_explicit(),
+            host.target.username(),
+            host.environment,
+        ],
+    )?;
+    transaction.execute(
+        "DELETE FROM host_tags WHERE host_id = ?1",
+        [host.id.to_string()],
+    )?;
+    for tag in &host.tags {
+        transaction.execute(
+            "INSERT INTO host_tags(host_id, tag) VALUES (?1, ?2)",
+            params![host.id.to_string(), tag],
+        )?;
+    }
+    Ok(())
+}
+
 impl SqliteStorage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let connection = Connection::open(path)?;
@@ -403,41 +446,17 @@ impl SqliteStorage {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            r#"
-                INSERT INTO hosts (
-                    id, label, hostname, port, port_explicit, username, environment
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                ON CONFLICT(id) DO UPDATE SET
-                    label = excluded.label,
-                    hostname = excluded.hostname,
-                    port = excluded.port,
-                    port_explicit = excluded.port_explicit,
-                    username = excluded.username,
-                    environment = excluded.environment,
-                    revision = hosts.revision + 1,
-                    updated_at_unix = unixepoch(),
-                    deleted_at_unix = NULL
-            "#,
-            params![
-                host.id.to_string(),
-                host.label,
-                host.target.host(),
-                host.target.port(),
-                host.target.port_is_explicit(),
-                host.target.username(),
-                host.environment,
-            ],
-        )?;
-        transaction.execute(
-            "DELETE FROM host_tags WHERE host_id = ?1",
-            [host.id.to_string()],
-        )?;
-        for tag in &host.tags {
-            transaction.execute(
-                "INSERT INTO host_tags(host_id, tag) VALUES (?1, ?2)",
-                params![host.id.to_string(), tag],
-            )?;
+        save_host_in_transaction(&transaction, host)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn save_hosts_atomically(&mut self, hosts: &[Host]) -> Result<(), StorageError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for host in hosts {
+            save_host_in_transaction(&transaction, host)?;
         }
         transaction.commit()?;
         Ok(())
@@ -1283,6 +1302,17 @@ mod tests {
             Some(expected.clone())
         );
         assert_eq!(storage.list_hosts().unwrap(), vec![expected]);
+    }
+
+    #[test]
+    fn batch_host_save_rolls_back_every_entry_on_failure() {
+        let mut storage = SqliteStorage::open_in_memory().unwrap();
+        let valid = host("Valid", "admin@valid.example");
+        let mut invalid = host("Invalid", "admin@invalid.example");
+        invalid.tags.insert("   ".to_owned());
+
+        assert!(storage.save_hosts_atomically(&[valid, invalid]).is_err());
+        assert!(storage.list_hosts().unwrap().is_empty());
     }
 
     #[test]

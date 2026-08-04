@@ -43,7 +43,17 @@ cargo run -p yasc-cli -- connect --config ~/.ssh/config admin@example.com
 cargo run -p yasc-cli -- --database ./yasc.db host add production admin@example.com \
   --tag linux --tag production --environment production
 cargo run -p yasc-cli -- --database ./yasc.db host list
+cargo run -p yasc-cli -- --database ./yasc.db host import-open-ssh \
+  --config ~/.ssh/config --json
+cargo run -p yasc-cli -- --database ./yasc.db host import-open-ssh \
+  --config ~/.ssh/config --apply
 ```
+
+OpenSSH inventory import is preview-only unless `--apply` is explicit. It discovers literal aliases
+and asks `ssh -G` for their exact effective target. Dynamic patterns are reported, entries using
+unrepresented routing or host-identity semantics are blocked, and `Include` or `Match exec` is
+rejected before OpenSSH runs. Imported hosts are committed atomically and tagged `openssh-import`;
+credentials and other connection behavior are never silently copied.
 
 Host-key trust is stored separately from inventory metadata. Every accepted first-use key,
 authenticated update, manual rotation, and revocation creates an immutable audit event:

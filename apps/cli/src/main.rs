@@ -286,6 +286,8 @@ enum HostCommand {
     Show(HostIdArgs),
     /// Remove a host by creating a local tombstone.
     Remove(HostIdArgs),
+    /// Preview or apply a loss-aware import from an OpenSSH configuration.
+    ImportOpenSsh(HostImportOpenSshArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -429,6 +431,25 @@ struct HostAddArgs {
     /// Mark the host environment, for example development or production.
     #[arg(long)]
     environment: Option<String>,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct HostImportOpenSshArgs {
+    /// OpenSSH configuration to inspect. Include directives are rejected in this initial slice.
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// Persist importable entries atomically. Without this flag, the command is preview-only.
+    #[arg(long)]
+    apply: bool,
+    /// Attach an additional searchable tag to every imported host. May be repeated.
+    #[arg(long)]
+    tag: Vec<String>,
+    /// OpenSSH executable or absolute path used for exact effective configuration evaluation.
+    #[arg(long, default_value = "ssh", value_name = "PATH")]
+    ssh_binary: PathBuf,
     /// Print machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -1383,6 +1404,70 @@ fn run_host_command(database: Option<PathBuf>, command: HostCommand) -> Result<(
                 println!("{{\"removed\":\"{}\"}}", args.id);
             } else {
                 println!("Removed host {} from the active inventory.", args.id);
+            }
+        }
+        HostCommand::ImportOpenSsh(args) => {
+            let preview = OpenSshEngine::new(args.ssh_binary).inventory_preview(&args.config)?;
+            let existing = storage.list_hosts()?;
+            let mut tags = validate_tags(args.tag)?;
+            tags.insert("openssh-import".to_owned());
+            let mut ready = Vec::new();
+            let mut already_present_aliases = Vec::new();
+            for candidate in &preview.candidates {
+                if !candidate.blockers.is_empty() {
+                    continue;
+                }
+                if existing.iter().any(|host| {
+                    host.label.eq_ignore_ascii_case(&candidate.alias)
+                        || host.target == candidate.target
+                }) {
+                    already_present_aliases.push(candidate.alias.clone());
+                    continue;
+                }
+                let mut host = Host::new(candidate.alias.clone(), candidate.target.clone())?;
+                host.tags = tags.clone();
+                ready.push(host);
+            }
+            if args.apply {
+                storage.save_hosts_atomically(&ready)?;
+            }
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "applied": args.apply,
+                        "preview": preview,
+                        "ready": ready,
+                        "already_present_aliases": already_present_aliases,
+                    }))?
+                );
+            } else {
+                for candidate in &preview.candidates {
+                    if candidate.blockers.is_empty() {
+                        let state = if already_present_aliases.contains(&candidate.alias) {
+                            "already present"
+                        } else if args.apply {
+                            "imported"
+                        } else {
+                            "ready"
+                        };
+                        println!("{}  {}  {state}", candidate.alias, candidate.target);
+                    } else {
+                        println!(
+                            "{}  {}  blocked: {:?}",
+                            candidate.alias, candidate.target, candidate.blockers
+                        );
+                    }
+                }
+                for skipped in &preview.skipped_patterns {
+                    println!("{}  skipped: {:?}", skipped.pattern, skipped.reason);
+                }
+                if !args.apply {
+                    println!(
+                        "Preview only: {} host(s) ready; re-run with --apply to persist them.",
+                        ready.len()
+                    );
+                }
             }
         }
     }

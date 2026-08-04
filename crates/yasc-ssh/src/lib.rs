@@ -12,9 +12,10 @@ pub use native::{
 };
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
+    fs,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
 };
@@ -194,6 +195,48 @@ impl OpenSshEngine {
             })
     }
 
+    /// Discovers literal `Host` aliases, resolves their current OpenSSH configuration, and marks
+    /// entries whose routing or host-identity semantics cannot be represented by a plain inventory
+    /// target. No product state is changed by this operation.
+    pub fn inventory_preview(
+        &self,
+        config_file: &Path,
+    ) -> Result<OpenSshInventoryPreview, OpenSshError> {
+        let contents =
+            fs::read_to_string(config_file).map_err(|source| OpenSshError::ReadImportConfig {
+                path: config_file.to_owned(),
+                source,
+            })?;
+        let discovery = discover_literal_hosts(&contents)?;
+        let mut candidates = Vec::new();
+        let mut skipped_patterns = discovery.skipped_patterns;
+        for alias in discovery.aliases {
+            let alias_target = match alias.parse::<SshTarget>() {
+                Ok(target) => target,
+                Err(_) => {
+                    skipped_patterns.push(OpenSshSkippedPattern {
+                        pattern: alias,
+                        reason: OpenSshSkipReason::InvalidAlias,
+                    });
+                    continue;
+                }
+            };
+            let mut request = OpenSshRequest::new(alias_target);
+            request.config_file = Some(config_file.to_owned());
+            let effective = self.effective_config(&request)?;
+            candidates.push(OpenSshImportCandidate::from_effective(alias, &effective)?);
+        }
+        let mut notices = vec![OpenSshImportNotice::CredentialsNotImported];
+        if discovery.has_conditional_blocks {
+            notices.push(OpenSshImportNotice::ConditionalBlocksEvaluatedForCurrentContext);
+        }
+        Ok(OpenSshInventoryPreview {
+            candidates,
+            skipped_patterns,
+            notices,
+        })
+    }
+
     fn command(&self, request: &OpenSshRequest, inspect_only: bool) -> Command {
         let mut command = Command::new(&self.executable);
         command.args(request.arguments(inspect_only));
@@ -201,6 +244,204 @@ impl OpenSshEngine {
         command.envs(controlled_environment());
         command
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OpenSshInventoryPreview {
+    pub candidates: Vec<OpenSshImportCandidate>,
+    pub skipped_patterns: Vec<OpenSshSkippedPattern>,
+    pub notices: Vec<OpenSshImportNotice>,
+}
+
+impl OpenSshInventoryPreview {
+    #[must_use]
+    pub fn importable_count(&self) -> usize {
+        self.candidates
+            .iter()
+            .filter(|candidate| candidate.blockers.is_empty())
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OpenSshImportCandidate {
+    pub alias: String,
+    pub target: SshTarget,
+    pub blockers: Vec<OpenSshImportBlocker>,
+}
+
+impl OpenSshImportCandidate {
+    fn from_effective(alias: String, config: &EffectiveConfig) -> Result<Self, OpenSshError> {
+        let hostname = config
+            .get("hostname")
+            .ok_or_else(|| OpenSshError::MissingImportValue {
+                alias: alias.clone(),
+                key: "hostname",
+            })?;
+        let port = config
+            .get("port")
+            .ok_or_else(|| OpenSshError::MissingImportValue {
+                alias: alias.clone(),
+                key: "port",
+            })?
+            .parse::<u16>()
+            .map_err(|_| OpenSshError::InvalidImportTarget {
+                alias: alias.clone(),
+            })?;
+        if port == 0 {
+            return Err(OpenSshError::InvalidImportTarget { alias });
+        }
+        let user = config.get("user");
+        let host = if hostname.contains(':') && !hostname.starts_with('[') {
+            format!("[{hostname}]")
+        } else {
+            hostname.to_owned()
+        };
+        let mut value = user.map_or(host.clone(), |user| format!("{user}@{host}"));
+        if port != 22 {
+            value.push(':');
+            value.push_str(&port.to_string());
+        }
+        let target = value
+            .parse::<SshTarget>()
+            .map_err(|_| OpenSshError::InvalidImportTarget {
+                alias: alias.clone(),
+            })?;
+        let mut blockers = Vec::new();
+        if config.get("proxycommand").is_some() {
+            blockers.push(OpenSshImportBlocker::ProxyCommand);
+        }
+        if config.get("proxyjump").is_some() {
+            blockers.push(OpenSshImportBlocker::ProxyJump);
+        }
+        if config.get("hostkeyalias").is_some() {
+            blockers.push(OpenSshImportBlocker::HostKeyAlias);
+        }
+        if config.get("knownhostscommand").is_some() {
+            blockers.push(OpenSshImportBlocker::KnownHostsCommand);
+        }
+        if config
+            .get("canonicalizehostname")
+            .is_some_and(|value| !value.eq_ignore_ascii_case("false"))
+        {
+            blockers.push(OpenSshImportBlocker::HostnameCanonicalization);
+        }
+        Ok(Self {
+            alias,
+            target,
+            blockers,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenSshImportBlocker {
+    ProxyCommand,
+    ProxyJump,
+    HostKeyAlias,
+    KnownHostsCommand,
+    HostnameCanonicalization,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OpenSshSkippedPattern {
+    pub pattern: String,
+    pub reason: OpenSshSkipReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenSshSkipReason {
+    DynamicPattern,
+    InvalidAlias,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenSshImportNotice {
+    CredentialsNotImported,
+    ConditionalBlocksEvaluatedForCurrentContext,
+}
+
+struct HostDiscovery {
+    aliases: BTreeSet<String>,
+    skipped_patterns: Vec<OpenSshSkippedPattern>,
+    has_conditional_blocks: bool,
+}
+
+fn discover_literal_hosts(contents: &str) -> Result<HostDiscovery, OpenSshError> {
+    let mut aliases = BTreeSet::new();
+    let mut skipped_patterns = Vec::new();
+    let mut has_conditional_blocks = false;
+    for (index, raw_line) in contents.lines().enumerate() {
+        let line_number = index + 1;
+        let line = raw_line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((directive, value)) = split_openssh_directive(line) else {
+            continue;
+        };
+        if directive.eq_ignore_ascii_case("include") {
+            return Err(OpenSshError::UnsafeImportDirective {
+                line: line_number,
+                directive: "Include",
+            });
+        }
+        if directive.eq_ignore_ascii_case("match") {
+            has_conditional_blocks = true;
+            if value.split_ascii_whitespace().any(|token| {
+                token.eq_ignore_ascii_case("exec")
+                    || token
+                        .get(..5)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("exec="))
+            }) {
+                return Err(OpenSshError::UnsafeImportDirective {
+                    line: line_number,
+                    directive: "Match exec",
+                });
+            }
+            continue;
+        }
+        if !directive.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        for pattern in value
+            .split_ascii_whitespace()
+            .take_while(|token| !token.starts_with('#'))
+        {
+            if pattern == "*" {
+                continue;
+            }
+            if pattern.contains(['*', '?', '!', '[', ']']) || pattern.contains(['\'', '"']) {
+                skipped_patterns.push(OpenSshSkippedPattern {
+                    pattern: pattern.to_owned(),
+                    reason: OpenSshSkipReason::DynamicPattern,
+                });
+            } else {
+                aliases.insert(pattern.to_owned());
+            }
+        }
+    }
+    Ok(HostDiscovery {
+        aliases,
+        skipped_patterns,
+        has_conditional_blocks,
+    })
+}
+
+fn split_openssh_directive(line: &str) -> Option<(&str, &str)> {
+    let key_end = line
+        .find(|character: char| character.is_ascii_whitespace() || character == '=')
+        .unwrap_or(line.len());
+    let directive = &line[..key_end];
+    let value = line[key_end..]
+        .trim_start_matches(|character: char| character.is_ascii_whitespace())
+        .strip_prefix('=')
+        .unwrap_or(&line[key_end..])
+        .trim_start();
+    (!directive.is_empty() && !value.is_empty()).then_some((directive, value))
 }
 
 fn controlled_environment() -> Vec<(OsString, OsString)> {
@@ -342,6 +583,23 @@ pub struct EffectiveConfigEntry {
 
 #[derive(Debug, Error)]
 pub enum OpenSshError {
+    #[error("failed to read OpenSSH import configuration {path}: {source}")]
+    ReadImportConfig {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "OpenSSH inventory import refuses {directive} at line {line}; preview would not be safely complete"
+    )]
+    UnsafeImportDirective {
+        line: usize,
+        directive: &'static str,
+    },
+    #[error("OpenSSH effective configuration for {alias} is missing {key}")]
+    MissingImportValue { alias: String, key: &'static str },
+    #[error("OpenSSH effective configuration for {alias} is not a valid inventory target")]
+    InvalidImportTarget { alias: String },
     #[error("failed to launch OpenSSH for {operation}: {source}")]
     Launch {
         operation: &'static str,
@@ -410,6 +668,80 @@ mod tests {
             .unwrap();
         assert_eq!(proxy.value, "[REDACTED]");
         assert!(proxy.redacted);
+    }
+
+    #[test]
+    fn inventory_discovery_keeps_literal_aliases_and_reports_patterns() {
+        let discovery = discover_literal_hosts(
+            r#"
+                Host *
+                    ServerAliveInterval 30
+                Host production prod-backup *.internal !retired
+                    HostName 192.0.2.10
+                Match user deploy
+                    Compression yes
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            discovery.aliases,
+            ["prod-backup".to_owned(), "production".to_owned()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            discovery.skipped_patterns,
+            vec![
+                OpenSshSkippedPattern {
+                    pattern: "*.internal".to_owned(),
+                    reason: OpenSshSkipReason::DynamicPattern,
+                },
+                OpenSshSkippedPattern {
+                    pattern: "!retired".to_owned(),
+                    reason: OpenSshSkipReason::DynamicPattern,
+                },
+            ]
+        );
+        assert!(discovery.has_conditional_blocks);
+    }
+
+    #[test]
+    fn inventory_discovery_refuses_unscanned_or_executable_configuration() {
+        assert!(matches!(
+            discover_literal_hosts("Include conf.d/*.conf\nHost production\n"),
+            Err(OpenSshError::UnsafeImportDirective {
+                line: 1,
+                directive: "Include"
+            })
+        ));
+        assert!(matches!(
+            discover_literal_hosts("Match exec \"helper %h\"\nHost production\n"),
+            Err(OpenSshError::UnsafeImportDirective {
+                line: 1,
+                directive: "Match exec"
+            })
+        ));
+    }
+
+    #[test]
+    fn inventory_candidate_blocks_unrepresented_route_and_trust_semantics() {
+        let config = EffectiveConfig::parse(
+            "user deploy\nhostname 192.0.2.10\nport 2200\nproxyjump bastion\nhostkeyalias canonical-host\ncanonicalizehostname false\n",
+        )
+        .unwrap();
+
+        let candidate =
+            OpenSshImportCandidate::from_effective("production".to_owned(), &config).unwrap();
+
+        assert_eq!(candidate.target.to_string(), "deploy@192.0.2.10:2200");
+        assert_eq!(
+            candidate.blockers,
+            vec![
+                OpenSshImportBlocker::ProxyJump,
+                OpenSshImportBlocker::HostKeyAlias,
+            ]
+        );
     }
 
     #[test]
