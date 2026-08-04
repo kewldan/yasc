@@ -11,20 +11,22 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossterm::terminal;
 use thiserror::Error;
 use yasc_domain::{
     Credential, CredentialCapabilities, CredentialGrant, CredentialId, CredentialProviderKind,
-    CredentialUsage, Custody, Host, HostId, HostKeyAlgorithm, HostKeyDecision, HostKeyError,
-    HostKeyFingerprint, HostKeyMaterial, HostKeyObservation, HostKeyPolicy, HostKeySource,
-    SshTarget, Synchronization,
+    CredentialUsage, Custody, ExternalKeyReference, Host, HostId, HostKeyAlgorithm,
+    HostKeyDecision, HostKeyError, HostKeyFingerprint, HostKeyMaterial, HostKeyObservation,
+    HostKeyPolicy, HostKeySource, SshTarget, Synchronization,
 };
 use yasc_platform::{PlatformError, PlatformPaths};
 use yasc_ssh::{
-    ConnectionPlan, HostKeyPolicy as OpenSshHostKeyPolicy, NativeCommandRequest, NativeShellIo,
-    NativeShellRequest, NativeSshEngine, NativeSshError, OpenSshEngine, OpenSshError,
-    OpenSshRequest, SshEngine, TerminalSize, validate_private_key,
+    ConnectionPlan, HostKeyPolicy as OpenSshHostKeyPolicy, NativeAgentCommandRequest,
+    NativeAgentShellRequest, NativeCommandRequest, NativeShellIo, NativeShellRequest,
+    NativeSshEngine, NativeSshError, OpenSshEngine, OpenSshError, OpenSshRequest, SshEngine,
+    TerminalSize, connect_agent, external_key_fingerprint, list_agent_identities,
+    validate_private_key,
 };
 use yasc_storage::{SqliteStorage, StorageError};
 use yasc_vault::{EncryptedVault, SecretBytes, SecretKind, VaultBackend, VaultError};
@@ -64,10 +66,15 @@ enum Command {
         #[command(subcommand)]
         command: VaultCommand,
     },
-    /// Import and inspect encrypted SSH credentials.
+    /// Import and inspect local-vault and external-agent SSH credentials.
     Credential {
         #[command(subcommand)]
         command: CredentialCommand,
+    },
+    /// Inspect identities available from an external SSH agent.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
     },
 }
 
@@ -78,10 +85,10 @@ struct NativeExecArgs {
     /// Private key in an OpenSSH, PKCS#8, PEM, or supported PuTTY text format.
     #[arg(long, value_name = "PATH")]
     identity: Option<PathBuf>,
-    /// Encrypted local-vault credential identifier.
+    /// Local-vault or external-agent credential identifier.
     #[arg(long, value_name = "ID")]
     credential: Option<CredentialId>,
-    /// File containing the local vault password. Required with --credential.
+    /// File containing the local vault password. Required only for local-vault credentials.
     #[arg(long, value_name = "PATH")]
     vault_password_file: Option<PathBuf>,
     /// File containing the private-key passphrase. Trailing CR/LF bytes are removed.
@@ -107,10 +114,10 @@ struct NativeShellArgs {
     /// Private key in an OpenSSH, PKCS#8, PEM, or supported PuTTY text format.
     #[arg(long, value_name = "PATH")]
     identity: Option<PathBuf>,
-    /// Encrypted local-vault credential identifier.
+    /// Local-vault or external-agent credential identifier.
     #[arg(long, value_name = "ID")]
     credential: Option<CredentialId>,
-    /// File containing the local vault password. Required with --credential.
+    /// File containing the local vault password. Required only for local-vault credentials.
     #[arg(long, value_name = "PATH")]
     vault_password_file: Option<PathBuf>,
     /// File containing the private-key passphrase. Trailing CR/LF bytes are removed.
@@ -141,8 +148,42 @@ struct VaultInitArgs {
 enum CredentialCommand {
     /// Validate and encrypt a private key for explicitly selected hosts.
     ImportKey(CredentialImportKeyArgs),
+    /// Register a non-exportable key already available from an SSH agent.
+    ImportAgent(CredentialImportAgentArgs),
     /// List credential metadata without unlocking the vault.
     List(OutputArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AgentProviderArg {
+    #[value(name = "openssh")]
+    OpenSsh,
+    Pageant,
+}
+
+impl From<AgentProviderArg> for CredentialProviderKind {
+    fn from(value: AgentProviderArg) -> Self {
+        match value {
+            AgentProviderArg::OpenSsh => Self::OpenSshAgent,
+            AgentProviderArg::Pageant => Self::Pageant,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentCommand {
+    /// List public identities without requesting signatures.
+    List(AgentListArgs),
+}
+
+#[derive(Debug, Args)]
+struct AgentListArgs {
+    /// External agent implementation.
+    #[arg(long, value_enum, default_value_t = AgentProviderArg::OpenSsh)]
+    provider: AgentProviderArg,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -161,6 +202,23 @@ struct CredentialImportKeyArgs {
     /// File containing the local vault password.
     #[arg(long, value_name = "PATH")]
     vault_password_file: PathBuf,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CredentialImportAgentArgs {
+    /// Human-readable credential label.
+    label: String,
+    /// Public-key SHA-256 fingerprint returned by `yasc agent list`.
+    fingerprint: String,
+    /// Host allowed to use this credential. May be repeated.
+    #[arg(long = "host", required = true, value_name = "HOST_ID")]
+    host_ids: Vec<HostId>,
+    /// External agent implementation.
+    #[arg(long, value_enum, default_value_t = AgentProviderArg::OpenSsh)]
+    provider: AgentProviderArg,
     /// Print machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -474,7 +532,8 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Host { command } => run_host_command(cli.database, command)?,
         Command::HostKey { command } => run_host_key_command(cli.database, command).await?,
         Command::Vault { command } => run_vault_command(cli.database, command)?,
-        Command::Credential { command } => run_credential_command(cli.database, command)?,
+        Command::Credential { command } => run_credential_command(cli.database, command).await?,
+        Command::Agent { command } => run_agent_command(command).await?,
     }
     Ok(())
 }
@@ -501,26 +560,31 @@ fn run_vault_command(database: Option<PathBuf>, command: VaultCommand) -> Result
     Ok(())
 }
 
-fn run_credential_command(
+async fn run_credential_command(
     database: Option<PathBuf>,
     command: CredentialCommand,
 ) -> Result<(), CliError> {
     match command {
         CredentialCommand::ImportKey(args) => import_key_credential(database, args)?,
+        CredentialCommand::ImportAgent(args) => import_agent_credential(database, args).await?,
         CredentialCommand::List(args) => {
             let storage = open_storage(database)?;
             let credentials = storage.list_credentials()?;
             if args.json {
-                let rows = credentials.iter().map(credential_json).collect::<Vec<_>>();
+                let rows = credentials
+                    .iter()
+                    .map(credential_json)
+                    .collect::<Result<Vec<_>, _>>()?;
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             } else if credentials.is_empty() {
                 println!("No credentials");
             } else {
                 for persisted in &credentials {
                     println!(
-                        "{}  {}  local-vault  hosts:{}{}",
+                        "{}  {}  {}  hosts:{}{}",
                         persisted.credential.id,
                         persisted.credential.label,
+                        credential_provider_name(persisted.credential.provider),
                         persisted
                             .grants
                             .iter()
@@ -536,6 +600,99 @@ fn run_credential_command(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+const fn credential_provider_name(provider: CredentialProviderKind) -> &'static str {
+    match provider {
+        CredentialProviderKind::LocalVault => "local-vault",
+        CredentialProviderKind::NativeKeystore => "native-keystore",
+        CredentialProviderKind::OpenSshAgent => "openssh-agent",
+        CredentialProviderKind::Pageant => "pageant",
+        CredentialProviderKind::Pkcs11 => "pkcs11",
+        CredentialProviderKind::Fido => "fido",
+        CredentialProviderKind::ExternalPasswordManager => "external-password-manager",
+        CredentialProviderKind::ServerDelegation => "server-delegation",
+    }
+}
+
+async fn run_agent_command(command: AgentCommand) -> Result<(), CliError> {
+    match command {
+        AgentCommand::List(args) => {
+            let mut agent = connect_agent(args.provider.into()).await?;
+            let identities = list_agent_identities(&mut agent).await?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&identities)?);
+            } else if identities.is_empty() {
+                println!("No agent identities");
+            } else {
+                for identity in identities {
+                    println!(
+                        "{}  {}{}",
+                        identity.fingerprint,
+                        identity.algorithm,
+                        if identity.comment.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  {}", identity.comment)
+                        }
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn import_agent_credential(
+    database: Option<PathBuf>,
+    args: CredentialImportAgentArgs,
+) -> Result<(), CliError> {
+    if args.label.trim().is_empty() {
+        return Err(CliError::EmptyCredentialLabel);
+    }
+    let mut storage = open_storage(database)?;
+    for host_id in &args.host_ids {
+        if storage.find_host(*host_id)?.is_none() {
+            return Err(CliError::HostNotFound(*host_id));
+        }
+    }
+    let provider = CredentialProviderKind::from(args.provider);
+    let mut agent = connect_agent(provider).await?;
+    let identity = list_agent_identities(&mut agent)
+        .await?
+        .into_iter()
+        .find(|identity| identity.fingerprint == args.fingerprint)
+        .ok_or_else(|| CliError::AgentFingerprintNotFound(args.fingerprint.clone()))?;
+    let capabilities = CredentialCapabilities::new(
+        Custody::ExternalProvider,
+        Synchronization::LocalOnly,
+        [CredentialUsage::DirectSsh],
+    )?;
+    let credential = Credential::new_external_key(
+        args.label.trim(),
+        provider,
+        capabilities,
+        identity.external_reference()?,
+    )?;
+    let grant = CredentialGrant::new(credential.id, args.host_ids, [CredentialUsage::DirectSsh])?;
+    storage.save_credential(&credential, &[], std::slice::from_ref(&grant))?;
+    if args.json {
+        let persisted = yasc_storage::PersistedCredential {
+            credential,
+            secret_refs: Vec::new(),
+            grants: vec![grant],
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&credential_json(&persisted)?)?
+        );
+    } else {
+        println!(
+            "Agent credential registered: {} ({})",
+            credential.label, credential.id
+        );
     }
     Ok(())
 }
@@ -608,7 +765,7 @@ fn import_key_credential(
         };
         println!(
             "{}",
-            serde_json::to_string_pretty(&credential_json(&persisted))?
+            serde_json::to_string_pretty(&credential_json(&persisted)?)?
         );
     } else {
         println!(
@@ -619,13 +776,27 @@ fn import_key_credential(
     Ok(())
 }
 
-fn credential_json(persisted: &yasc_storage::PersistedCredential) -> serde_json::Value {
+fn credential_json(
+    persisted: &yasc_storage::PersistedCredential,
+) -> Result<serde_json::Value, CliError> {
     let host_ids = persisted
         .grants
         .iter()
         .flat_map(|grant| grant.host_ids.iter())
         .collect::<BTreeSet<_>>();
-    serde_json::json!({
+    let external_key = persisted
+        .credential
+        .external_key
+        .as_ref()
+        .map(|reference| {
+            Ok::<_, CliError>(serde_json::json!({
+                "algorithm": reference.algorithm,
+                "fingerprint": external_key_fingerprint(reference)?,
+                "comment": reference.comment,
+            }))
+        })
+        .transpose()?;
+    Ok(serde_json::json!({
         "id": persisted.credential.id,
         "label": persisted.credential.label,
         "provider": persisted.credential.provider,
@@ -635,7 +806,8 @@ fn credential_json(persisted: &yasc_storage::PersistedCredential) -> serde_json:
         "host_ids": host_ids,
         "has_private_key": persisted.secret(SecretKind::SshPrivateKey).is_some(),
         "has_passphrase": persisted.secret(SecretKind::Passphrase).is_some(),
-    })
+        "external_key": external_key,
+    }))
 }
 
 async fn run_native_exec(database: Option<PathBuf>, args: NativeExecArgs) -> Result<(), CliError> {
@@ -649,7 +821,7 @@ async fn run_native_exec(database: Option<PathBuf>, args: NativeExecArgs) -> Res
         .ok_or(CliError::NativeUsernameRequired)?
         .to_owned();
     let history = storage.load_host_key_history(args.host_id)?;
-    let (private_key, passphrase) = resolve_native_authentication(
+    let authentication = resolve_native_authentication(
         storage,
         args.host_id,
         args.identity.as_deref(),
@@ -657,21 +829,45 @@ async fn run_native_exec(database: Option<PathBuf>, args: NativeExecArgs) -> Res
         args.vault_password_file.as_deref(),
         args.passphrase_file.as_deref(),
     )?;
-    let mut request = NativeCommandRequest::new(
-        host.target,
-        username,
-        private_key,
-        args.command.into_bytes(),
-    )?
-    .with_timeout(Duration::from_secs(args.timeout_seconds))?
-    .with_max_output_bytes(args.max_output_bytes)?;
-    if let Some(passphrase) = passphrase {
-        request = request.with_passphrase(passphrase);
-    }
     let engine = NativeSshEngine::default();
-    let output = engine
-        .execute_command(request, &history, &HostKeyPolicy::strict())
-        .await?;
+    let output = match authentication {
+        ResolvedNativeAuthentication::PrivateKey {
+            private_key,
+            passphrase,
+        } => {
+            let mut request = NativeCommandRequest::new(
+                host.target,
+                username,
+                private_key,
+                args.command.into_bytes(),
+            )?
+            .with_timeout(Duration::from_secs(args.timeout_seconds))?
+            .with_max_output_bytes(args.max_output_bytes)?;
+            if let Some(passphrase) = passphrase {
+                request = request.with_passphrase(passphrase);
+            }
+            engine
+                .execute_command(request, &history, &HostKeyPolicy::strict())
+                .await?
+        }
+        ResolvedNativeAuthentication::Agent {
+            provider,
+            external_key,
+        } => {
+            let request = NativeAgentCommandRequest::new(
+                host.target,
+                username,
+                external_key,
+                args.command.into_bytes(),
+            )?
+            .with_timeout(Duration::from_secs(args.timeout_seconds))?
+            .with_max_output_bytes(args.max_output_bytes)?;
+            let mut agent = connect_agent(provider).await?;
+            engine
+                .execute_agent_command(request, &mut agent, &history, &HostKeyPolicy::strict())
+                .await?
+        }
+    };
     if args.json {
         println!(
             "{}",
@@ -711,7 +907,7 @@ async fn run_native_shell(
         .ok_or(CliError::NativeUsernameRequired)?
         .to_owned();
     let history = storage.load_host_key_history(args.host_id)?;
-    let (private_key, passphrase) = resolve_native_authentication(
+    let authentication = resolve_native_authentication(
         storage,
         args.host_id,
         args.identity.as_deref(),
@@ -725,28 +921,60 @@ async fn run_native_shell(
         .terminal_type
         .or_else(|| env::var("TERM").ok())
         .unwrap_or_else(|| "xterm-256color".to_owned());
-    let mut request = NativeShellRequest::new(host.target, username, private_key, initial_size)?
-        .with_terminal_type(terminal_type)?;
-    if let Some(passphrase) = passphrase {
-        request = request.with_passphrase(passphrase);
-    }
 
     let raw_mode = RawModeGuard::enable()?;
     let (size_sender, size_receiver) = tokio::sync::watch::channel(initial_size);
     let resize_task = tokio::spawn(monitor_terminal_size(size_sender, initial_size));
-    let result = NativeSshEngine::default()
-        .run_shell(
-            request,
-            &history,
-            &HostKeyPolicy::strict(),
-            NativeShellIo::new(
-                tokio::io::stdin(),
-                tokio::io::stdout(),
-                tokio::io::stderr(),
-                size_receiver,
-            ),
-        )
-        .await;
+    let engine = NativeSshEngine::default();
+    let result = match authentication {
+        ResolvedNativeAuthentication::PrivateKey {
+            private_key,
+            passphrase,
+        } => {
+            let mut request =
+                NativeShellRequest::new(host.target, username, private_key, initial_size)?
+                    .with_terminal_type(terminal_type)?;
+            if let Some(passphrase) = passphrase {
+                request = request.with_passphrase(passphrase);
+            }
+            engine
+                .run_shell(
+                    request,
+                    &history,
+                    &HostKeyPolicy::strict(),
+                    NativeShellIo::new(
+                        tokio::io::stdin(),
+                        tokio::io::stdout(),
+                        tokio::io::stderr(),
+                        size_receiver,
+                    ),
+                )
+                .await
+        }
+        ResolvedNativeAuthentication::Agent {
+            provider,
+            external_key,
+        } => {
+            let request =
+                NativeAgentShellRequest::new(host.target, username, external_key, initial_size)?
+                    .with_terminal_type(terminal_type)?;
+            let mut agent = connect_agent(provider).await?;
+            engine
+                .run_agent_shell(
+                    request,
+                    &mut agent,
+                    &history,
+                    &HostKeyPolicy::strict(),
+                    NativeShellIo::new(
+                        tokio::io::stdin(),
+                        tokio::io::stdout(),
+                        tokio::io::stderr(),
+                        size_receiver,
+                    ),
+                )
+                .await
+        }
+    };
     resize_task.abort();
     drop(raw_mode);
     let output = result?;
@@ -756,6 +984,17 @@ async fn run_native_shell(
     Ok(())
 }
 
+enum ResolvedNativeAuthentication {
+    PrivateKey {
+        private_key: SecretBytes,
+        passphrase: Option<SecretBytes>,
+    },
+    Agent {
+        provider: CredentialProviderKind,
+        external_key: ExternalKeyReference,
+    },
+}
+
 fn resolve_native_authentication(
     storage: SqliteStorage,
     host_id: HostId,
@@ -763,18 +1002,18 @@ fn resolve_native_authentication(
     credential: Option<CredentialId>,
     vault_password_file: Option<&Path>,
     passphrase_file: Option<&Path>,
-) -> Result<(SecretBytes, Option<SecretBytes>), CliError> {
+) -> Result<ResolvedNativeAuthentication, CliError> {
     match (identity, credential) {
         (Some(identity), None) => {
             if vault_password_file.is_some() {
                 return Err(CliError::InvalidCredentialSelection);
             }
-            Ok((
-                read_secret_file(identity, false)?,
-                passphrase_file
+            Ok(ResolvedNativeAuthentication::PrivateKey {
+                private_key: read_secret_file(identity, false)?,
+                passphrase: passphrase_file
                     .map(|path| read_secret_file(path, true))
                     .transpose()?,
-            ))
+            })
         }
         (None, Some(credential_id)) => {
             if passphrase_file.is_some() {
@@ -784,11 +1023,10 @@ fn resolve_native_authentication(
                 .find_credential(credential_id)?
                 .ok_or(CliError::CredentialNotFound(credential_id))?;
             let now = unix_now()?;
-            if persisted.credential.provider != CredentialProviderKind::LocalVault
-                || !persisted
-                    .credential
-                    .capabilities
-                    .allows(CredentialUsage::DirectSsh)
+            if !persisted
+                .credential
+                .capabilities
+                .allows(CredentialUsage::DirectSsh)
                 || !persisted
                     .grants
                     .iter()
@@ -799,19 +1037,42 @@ fn resolve_native_authentication(
                     host_id,
                 });
             }
-            let password_path = vault_password_file.ok_or(CliError::VaultPasswordRequired)?;
-            let key_ref = persisted
-                .secret(SecretKind::SshPrivateKey)
-                .ok_or(CliError::CredentialPrivateKeyMissing(credential_id))?;
-            let passphrase_ref = persisted.secret(SecretKind::Passphrase);
-            let password = read_secret_file(password_path, true)?;
-            let mut vault = EncryptedVault::open(storage)?;
-            vault.unlock(password)?;
-            let private_key = vault.read(key_ref)?;
-            let passphrase = passphrase_ref
-                .map(|reference| vault.read(reference))
-                .transpose()?;
-            Ok((private_key, passphrase))
+            match persisted.credential.provider {
+                CredentialProviderKind::LocalVault => {
+                    let password_path =
+                        vault_password_file.ok_or(CliError::VaultPasswordRequired)?;
+                    let key_ref = persisted
+                        .secret(SecretKind::SshPrivateKey)
+                        .ok_or(CliError::CredentialPrivateKeyMissing(credential_id))?;
+                    let passphrase_ref = persisted.secret(SecretKind::Passphrase);
+                    let password = read_secret_file(password_path, true)?;
+                    let mut vault = EncryptedVault::open(storage)?;
+                    vault.unlock(password)?;
+                    let private_key = vault.read(key_ref)?;
+                    let passphrase = passphrase_ref
+                        .map(|reference| vault.read(reference))
+                        .transpose()?;
+                    Ok(ResolvedNativeAuthentication::PrivateKey {
+                        private_key,
+                        passphrase,
+                    })
+                }
+                provider @ (CredentialProviderKind::OpenSshAgent
+                | CredentialProviderKind::Pageant) => {
+                    if vault_password_file.is_some() {
+                        return Err(CliError::InvalidCredentialSelection);
+                    }
+                    let external_key = persisted
+                        .credential
+                        .external_key
+                        .ok_or(CliError::CredentialExternalKeyMissing(credential_id))?;
+                    Ok(ResolvedNativeAuthentication::Agent {
+                        provider,
+                        external_key,
+                    })
+                }
+                provider => Err(CliError::UnsupportedCredentialProvider(provider)),
+            }
         }
         _ => Err(CliError::InvalidCredentialSelection),
     }
@@ -1230,7 +1491,13 @@ enum CliError {
     },
     #[error("credential {0} has no encrypted SSH private key")]
     CredentialPrivateKeyMissing(CredentialId),
-    #[error("--vault-password-file is required with --credential")]
+    #[error("credential {0} has no external public-key reference")]
+    CredentialExternalKeyMissing(CredentialId),
+    #[error("no agent identity has fingerprint {0}")]
+    AgentFingerprintNotFound(String),
+    #[error("credential provider {0:?} is not supported by native SSH authentication")]
+    UnsupportedCredentialProvider(CredentialProviderKind),
+    #[error("--vault-password-file is required for a local-vault credential")]
     VaultPasswordRequired,
     #[error("failed to read secret file {path}: {source}")]
     ReadSecret {

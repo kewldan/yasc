@@ -98,6 +98,40 @@ pub enum CredentialProviderKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalKeyReference {
+    pub algorithm: String,
+    pub public_key_blob: Vec<u8>,
+    pub comment: Option<String>,
+}
+
+impl ExternalKeyReference {
+    pub fn new(
+        algorithm: impl Into<String>,
+        public_key_blob: impl Into<Vec<u8>>,
+        comment: Option<String>,
+    ) -> Result<Self, CredentialCapabilityError> {
+        let algorithm = algorithm.into();
+        let public_key_blob = public_key_blob.into();
+        if algorithm.is_empty()
+            || algorithm.len() > 128
+            || algorithm.chars().any(char::is_control)
+            || public_key_blob.is_empty()
+            || public_key_blob.len() > 64 * 1024
+            || comment
+                .as_ref()
+                .is_some_and(|value| value.len() > 1024 || value.chars().any(char::is_control))
+        {
+            return Err(CredentialCapabilityError::InvalidExternalKeyReference);
+        }
+        Ok(Self {
+            algorithm,
+            public_key_blob,
+            comment,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialCapabilities {
     pub custody: Custody,
     pub synchronization: Synchronization,
@@ -149,6 +183,10 @@ pub enum CredentialCapabilityError {
     NonExportableCannotBeExported,
     #[error("private synchronization does not authorize mediated SSH")]
     PrivateSyncCannotMediate,
+    #[error("external key reference metadata is invalid")]
+    InvalidExternalKeyReference,
+    #[error("credential provider and external key reference do not agree")]
+    ProviderReferenceMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +195,8 @@ pub struct Credential {
     pub label: String,
     pub provider: CredentialProviderKind,
     pub capabilities: CredentialCapabilities,
+    #[serde(default)]
+    pub external_key: Option<ExternalKeyReference>,
 }
 
 impl Credential {
@@ -171,6 +211,36 @@ impl Credential {
             label: label.into(),
             provider,
             capabilities,
+            external_key: None,
+        }
+    }
+
+    pub fn new_external_key(
+        label: impl Into<String>,
+        provider: CredentialProviderKind,
+        capabilities: CredentialCapabilities,
+        external_key: ExternalKeyReference,
+    ) -> Result<Self, CredentialCapabilityError> {
+        let credential = Self {
+            id: CredentialId::new(),
+            label: label.into(),
+            provider,
+            capabilities,
+            external_key: Some(external_key),
+        };
+        credential.validate_provider_reference()?;
+        Ok(credential)
+    }
+
+    pub fn validate_provider_reference(&self) -> Result<(), CredentialCapabilityError> {
+        match (self.provider, self.external_key.is_some()) {
+            (CredentialProviderKind::OpenSshAgent | CredentialProviderKind::Pageant, true)
+            | (CredentialProviderKind::LocalVault, false) => Ok(()),
+            (CredentialProviderKind::OpenSshAgent | CredentialProviderKind::Pageant, false)
+            | (CredentialProviderKind::LocalVault, true) => {
+                Err(CredentialCapabilityError::ProviderReferenceMismatch)
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -312,5 +382,74 @@ mod tests {
         grant.expires_at_unix = None;
         grant.requires_approval = true;
         assert!(!grant.authorizes(host_id, CredentialUsage::DirectSsh, 9));
+    }
+
+    #[test]
+    fn external_agent_key_requires_non_exportable_reference_metadata() {
+        let capabilities = CredentialCapabilities::new(
+            Custody::ExternalProvider,
+            Synchronization::LocalOnly,
+            [CredentialUsage::DirectSsh],
+        )
+        .unwrap();
+        let reference = ExternalKeyReference::new(
+            "ssh-ed25519",
+            vec![1, 2, 3],
+            Some("workstation agent".to_owned()),
+        )
+        .unwrap();
+        let credential = Credential::new_external_key(
+            "Agent key",
+            CredentialProviderKind::OpenSshAgent,
+            capabilities,
+            reference.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(credential.external_key, Some(reference));
+        assert!(credential.validate_provider_reference().is_ok());
+    }
+
+    #[test]
+    fn local_vault_cannot_claim_an_external_key_reference() {
+        let capabilities = CredentialCapabilities::new(
+            Custody::Exportable,
+            Synchronization::LocalOnly,
+            [CredentialUsage::DirectSsh],
+        )
+        .unwrap();
+        let reference = ExternalKeyReference::new("ssh-ed25519", vec![1], None).unwrap();
+
+        assert_eq!(
+            Credential::new_external_key(
+                "Invalid",
+                CredentialProviderKind::LocalVault,
+                capabilities,
+                reference,
+            )
+            .unwrap_err(),
+            CredentialCapabilityError::ProviderReferenceMismatch
+        );
+    }
+
+    #[test]
+    fn legacy_local_vault_payload_defaults_to_no_external_reference() {
+        let credential = Credential::new(
+            "Legacy",
+            CredentialProviderKind::LocalVault,
+            CredentialCapabilities::new(
+                Custody::Exportable,
+                Synchronization::LocalOnly,
+                [CredentialUsage::DirectSsh],
+            )
+            .unwrap(),
+        );
+        let mut payload = serde_json::to_value(&credential).unwrap();
+        payload.as_object_mut().unwrap().remove("external_key");
+
+        let restored: Credential = serde_json::from_value(payload).unwrap();
+
+        assert_eq!(restored, credential);
+        assert!(restored.validate_provider_reference().is_ok());
     }
 }

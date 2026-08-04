@@ -16,6 +16,78 @@ fn yasc(database: &Path, arguments: &[&str]) -> std::process::Output {
         .expect("yasc must execute")
 }
 
+#[cfg(unix)]
+fn yasc_with_agent(database: &Path, socket: &Path, arguments: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_yasc"))
+        .arg("--database")
+        .arg(database)
+        .args(arguments)
+        .env("SSH_AUTH_SOCK", socket)
+        .output()
+        .expect("yasc must execute")
+}
+
+#[cfg(unix)]
+struct AgentFixture {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl AgentFixture {
+    fn start(socket: &Path, private_key: PrivateKey) -> Self {
+        use futures::stream;
+        use russh::keys::agent::client::AgentClient;
+        use tokio::net::{UnixListener, UnixStream};
+
+        let socket = socket.to_owned();
+        let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    let listener = UnixListener::bind(&socket).unwrap();
+                    let incoming = stream::unfold(listener, |listener| async move {
+                        Some((listener.accept().await.map(|(stream, _)| stream), listener))
+                    });
+                    let server = russh::keys::agent::server::serve(Box::pin(incoming), ());
+                    tokio::pin!(server);
+                    let preload = async {
+                        let stream = UnixStream::connect(&socket).await.unwrap();
+                        let mut client = AgentClient::connect(stream);
+                        client.add_identity(&private_key, &[]).await.unwrap();
+                        ready_sender.send(()).unwrap();
+                        futures::future::pending::<()>().await;
+                    };
+                    tokio::pin!(preload);
+                    tokio::select! {
+                        result = &mut server => result.unwrap(),
+                        () = &mut preload => unreachable!(),
+                        _ = shutdown_receiver => {},
+                    }
+                });
+        });
+        ready_receiver.recv().unwrap();
+        Self {
+            shutdown: Some(shutdown_sender),
+            thread: Some(thread),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AgentFixture {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+    }
+}
+
 fn json(output: &std::process::Output) -> serde_json::Value {
     assert!(
         output.status.success(),
@@ -152,5 +224,54 @@ fn encrypted_credential_import_lists_metadata_and_enforces_host_grant() {
     assert!(
         String::from_utf8_lossy(&non_terminal_shell.stderr)
             .contains("requires terminal stdin and stdout")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn external_agent_import_persists_only_public_metadata_and_host_grant() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("yasc.db");
+    let socket = directory.path().join("agent.sock");
+    let private_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let encoded_private_key = private_key.to_openssh(LineEnding::LF).unwrap();
+    let _agent = AgentFixture::start(&socket, private_key);
+    let host_id = create_host(&database, "Agent host", "admin@agent.invalid");
+
+    let identities = json(&yasc_with_agent(
+        &database,
+        &socket,
+        &["agent", "list", "--json"],
+    ));
+    let fingerprint = identities[0]["fingerprint"].as_str().unwrap();
+    let imported = json(&yasc_with_agent(
+        &database,
+        &socket,
+        &[
+            "credential",
+            "import-agent",
+            "Workstation agent",
+            fingerprint,
+            "--host",
+            &host_id,
+            "--json",
+        ],
+    ));
+
+    assert_eq!(imported["provider"], "open_ssh_agent");
+    assert_eq!(imported["custody"], "external_provider");
+    assert_eq!(imported["synchronization"], "local_only");
+    assert_eq!(imported["host_ids"], serde_json::json!([host_id]));
+    assert_eq!(imported["has_private_key"], false);
+    assert_eq!(imported["external_key"]["fingerprint"], fingerprint);
+    assert_eq!(
+        json(&yasc(&database, &["credential", "list", "--json"]))[0],
+        imported
+    );
+    let database_bytes = fs::read(&database).unwrap();
+    assert!(
+        !database_bytes
+            .windows(encoded_private_key.len())
+            .any(|window| { window == encoded_private_key.as_bytes() })
     );
 }

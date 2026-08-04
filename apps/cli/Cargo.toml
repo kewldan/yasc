@@ -24,6 +24,7 @@ yasc-storage.workspace = true
 yasc-vault.workspace = true
 
 [dev-dependencies]
+futures = "0.3"
 rand = "0.10"
 russh = { version = "0.62.5", default-features = false, features = ["ring", "rsa"] }
 tempfile = "3"

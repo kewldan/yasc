@@ -5,9 +5,10 @@
 mod native;
 
 pub use native::{
+    AgentIdentityInfo, DynamicAgentClient, NativeAgentCommandRequest, NativeAgentShellRequest,
     NativeCommandOutput, NativeCommandRequest, NativeHostKeyProbe, NativeShellIo,
     NativeShellOutput, NativeShellRequest, NativeSshEngine, NativeSshError, TerminalSize,
-    validate_private_key,
+    connect_agent, external_key_fingerprint, list_agent_identities, validate_private_key,
 };
 
 use std::{

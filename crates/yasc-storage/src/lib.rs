@@ -485,6 +485,9 @@ impl SqliteStorage {
         secret_refs: &[SecretRef],
         grants: &[CredentialGrant],
     ) -> Result<(), StorageError> {
+        credential
+            .validate_provider_reference()
+            .map_err(|_| StorageError::InvalidCredentialBinding)?;
         let mut secret_kinds = BTreeSet::new();
         for reference in secret_refs {
             if reference.credential_id != credential.id || !secret_kinds.insert(reference.kind) {
@@ -564,7 +567,7 @@ impl SqliteStorage {
             return Ok(None);
         };
         let credential = serde_json::from_str::<Credential>(&payload)?;
-        if credential.id != id {
+        if credential.id != id || credential.validate_provider_reference().is_err() {
             return Err(StorageError::InvalidCredentialBinding);
         }
 
@@ -1178,7 +1181,7 @@ mod tests {
     use tempfile::tempdir;
     use yasc_domain::{
         CredentialCapabilities, CredentialGrant, CredentialProviderKind, CredentialUsage, Custody,
-        Synchronization,
+        ExternalKeyReference, Synchronization,
     };
     use yasc_vault::{
         EncryptedVault, SecretBytes, SecretKind, VaultBackend, VaultError, VaultState,
@@ -1395,6 +1398,41 @@ mod tests {
         assert_eq!(restored.secret(SecretKind::SshPrivateKey), Some(key_ref));
         assert_eq!(restored.grants, vec![grant]);
         assert_eq!(storage.list_credentials().unwrap(), vec![restored]);
+    }
+
+    #[test]
+    fn external_agent_credential_roundtrips_without_secret_material() {
+        let mut storage = SqliteStorage::open_in_memory().unwrap();
+        let host = host("Production", "admin@example.com");
+        storage.save_host(&host).unwrap();
+        let credential = Credential::new_external_key(
+            "Workstation agent",
+            CredentialProviderKind::OpenSshAgent,
+            CredentialCapabilities::new(
+                Custody::ExternalProvider,
+                Synchronization::LocalOnly,
+                [CredentialUsage::DirectSsh],
+            )
+            .unwrap(),
+            ExternalKeyReference::new(
+                "ssh-ed25519",
+                vec![1, 2, 3],
+                Some("agent comment".to_owned()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let grant =
+            CredentialGrant::new(credential.id, [host.id], [CredentialUsage::DirectSsh]).unwrap();
+
+        storage
+            .save_credential(&credential, &[], std::slice::from_ref(&grant))
+            .unwrap();
+        let restored = storage.find_credential(credential.id).unwrap().unwrap();
+
+        assert_eq!(restored.credential, credential);
+        assert!(restored.secret_refs.is_empty());
+        assert_eq!(restored.grants, vec![grant]);
     }
 
     #[test]

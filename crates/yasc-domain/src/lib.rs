@@ -8,8 +8,8 @@ mod host_key;
 
 pub use credential::{
     Credential, CredentialCapabilities, CredentialCapabilityError, CredentialGrant,
-    CredentialGrantError, CredentialId, CredentialProviderKind, CredentialUsage, Custody, GrantId,
-    Synchronization,
+    CredentialGrantError, CredentialId, CredentialProviderKind, CredentialUsage, Custody,
+    ExternalKeyReference, GrantId, Synchronization,
 };
 pub use host::{Host, HostError, HostId, SshTarget, TargetParseError};
 pub use host_key::{

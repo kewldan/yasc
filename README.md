@@ -95,6 +95,20 @@ cargo run -p yasc-cli -- --database ./yasc.db shell <HOST_ID> \
   --credential <CREDENTIAL_ID> --vault-password-file ./vault-password
 ```
 
+To keep a private key inside an existing SSH agent, register its public fingerprint instead of
+importing secret material. `openssh` uses `SSH_AUTH_SOCK` on Unix and the configured OpenSSH agent
+pipe on Windows; `pageant` is available on Windows:
+
+```bash
+cargo run -p yasc-cli -- agent list
+cargo run -p yasc-cli -- --database ./yasc.db credential import-agent \
+  "Workstation agent" <SHA256_FINGERPRINT> --host <HOST_ID>
+cargo run -p yasc-cli -- --database ./yasc.db exec <HOST_ID> \
+  --credential <CREDENTIAL_ID> 'uname -a'
+cargo run -p yasc-cli -- --database ./yasc.db shell <HOST_ID> \
+  --credential <CREDENTIAL_ID>
+```
+
 The native command path requires a username in the stored target, applies strict persistent
 host-key verification before authentication, rejects insecure key-file permissions on Unix, never
 accepts a passphrase on the command line, enforces a timeout and bounded output, and returns a
@@ -102,9 +116,10 @@ non-successful CLI status when the remote command fails. Vault imports validate 
 before encryption, store key passphrases as separate authenticated envelopes, and require a
 host-scoped direct-SSH grant before decryption. The `exec` command is a one-shot workflow; native
 interactive `shell` sessions use a confirmed PTY request, stream terminal bytes without retaining
-terminal contents,
-propagate terminal-size changes, and restore local raw mode on every return path. Native-keystore
-unlock is still in development.
+terminal contents, propagate terminal-size changes, and restore local raw mode on every return
+path. External-agent credentials persist only the selected public key, fingerprint metadata,
+provider, and host grant; the agent performs every signature and the private key is never exported
+to YASC. Native-keystore unlock is still in development.
 
 The same format, lint, and test gates run on Linux, macOS, and Windows in GitHub Actions.
 
