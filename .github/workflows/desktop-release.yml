@@ -1,0 +1,71 @@
+name: Desktop release
+
+on:
+  push:
+    tags:
+      - desktop-v*
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: macOS / ${{ matrix.target }}
+    runs-on: macos-14
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install pinned Rust target
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Cache Desktop Rust dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: apps/desktop/src-tauri -> target
+          key: ${{ matrix.target }}
+
+      - name: Install Desktop dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Test Desktop frontend
+        working-directory: apps/desktop
+        run: npm test
+
+      - name: Build and attach release bundles
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+          tagName: desktop-v__VERSION__
+          releaseName: YASC Desktop v__VERSION__
+          releaseBody: |
+            macOS MVP build for Apple Silicon and Intel.
+
+            These preview bundles are ad-hoc signed and are not notarized.
+          releaseDraft: true
+          prerelease: true
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
+          uploadWorkflowArtifacts: true
+          args: --target ${{ matrix.target }}

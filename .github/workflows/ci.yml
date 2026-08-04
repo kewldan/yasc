@@ -34,3 +34,52 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --locked
+
+  desktop-macos:
+    name: Desktop / macOS
+    runs-on: macos-14
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Cache Desktop Rust dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: apps/desktop/src-tauri -> target
+
+      - name: Install Desktop dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Test Desktop frontend
+        working-directory: apps/desktop
+        run: npm test
+
+      - name: Build Desktop frontend
+        working-directory: apps/desktop
+        run: npm run build
+
+      - name: Verify Desktop Rust formatting
+        run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
+
+      - name: Lint Desktop Rust backend
+        run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Test Desktop Rust backend
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+
+      - name: Build macOS application bundle
+        working-directory: apps/desktop
+        run: npm run tauri build -- --bundles app

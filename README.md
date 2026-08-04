@@ -16,6 +16,7 @@ currently in its **0.1 local foundation** stage.
 
 ```text
 apps/cli/              First-class command-line client
+apps/desktop/          Tauri 2 + React macOS desktop client
 crates/yasc-domain/    Stable product types and validation rules
 crates/yasc-ssh/       Product-facing SSH interfaces and connection plans
 crates/yasc-vault/     Credential lifecycle boundary
@@ -24,8 +25,9 @@ crates/yasc-platform/  Native OS integration boundary
 tests/                 Cross-crate and compatibility fixtures
 ```
 
-The desktop application will be introduced after the core and IPC boundary are proven. Product
-documentation lives in the separate
+The macOS Desktop MVP now provides local inventory, external-agent credential registration,
+explicit first-use host-key trust, and a native interactive SSH terminal. Product documentation
+lives in the separate
 [YASC documentation repository](https://github.com/kewldan/yasc-docs).
 
 ## 🚀 Bootstrap
@@ -48,6 +50,25 @@ cargo run -p yasc-cli -- --database ./yasc.db host import-open-ssh \
 cargo run -p yasc-cli -- --database ./yasc.db host import-open-ssh \
   --config ~/.ssh/config --apply
 ```
+
+Run the macOS Desktop MVP:
+
+```bash
+cd apps/desktop
+npm ci
+npm run tauri dev
+```
+
+Build a local application bundle and disk image:
+
+```bash
+cd apps/desktop
+npm run tauri build
+```
+
+Desktop preview releases are produced for Apple Silicon and Intel by the `Desktop release`
+workflow. Pushing a tag such as `desktop-v0.1.0` creates a draft prerelease with `.app` and `.dmg`
+assets. Current preview artifacts are ad-hoc signed and are not notarized.
 
 OpenSSH inventory import is preview-only unless `--apply` is explicit. It discovers literal aliases
 and asks `ssh -G` for their exact effective target. Dynamic patterns are reported, entries using
@@ -131,7 +152,8 @@ path. External-agent credentials persist only the selected public key, fingerpri
 provider, and host grant; the agent performs every signature and the private key is never exported
 to YASC. Native-keystore unlock is still in development.
 
-The same format, lint, and test gates run on Linux, macOS, and Windows in GitHub Actions.
+The same core format, lint, and test gates run on Linux, macOS, and Windows in GitHub Actions. A
+separate macOS job tests both Desktop layers and builds the application bundle in parallel.
 
 Without `--database`, the CLI stores inventory in the operating system's application-data
 directory. Host records contain connection metadata only; credential plaintext belongs exclusively
