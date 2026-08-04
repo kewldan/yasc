@@ -195,6 +195,12 @@ impl OpenSshEngine {
 }
 
 fn controlled_environment() -> Vec<(OsString, OsString)> {
+    env::vars_os()
+        .filter(|(key, _)| is_allowed_environment_key(&key.to_string_lossy()))
+        .collect()
+}
+
+fn is_allowed_environment_key(key: &str) -> bool {
     const ALLOWED: &[&str] = &[
         "PATH",
         "HOME",
@@ -217,13 +223,12 @@ fn controlled_environment() -> Vec<(OsString, OsString)> {
         "APPDATA",
         "LOCALAPPDATA",
     ];
-
-    env::vars_os()
-        .filter(|(key, _)| {
-            let key = key.to_string_lossy();
-            ALLOWED.iter().any(|allowed| key == *allowed) || key.starts_with("LC_")
-        })
-        .collect()
+    ALLOWED
+        .iter()
+        .any(|allowed| key.eq_ignore_ascii_case(allowed))
+        || key
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("LC_"))
 }
 
 fn safe_diagnostic(stderr: &[u8]) -> String {
@@ -407,6 +412,15 @@ mod tests {
 
         assert!(!diagnostic.contains("token=secret"));
         assert!(home.is_empty() || !diagnostic.contains(&home));
+    }
+
+    #[test]
+    fn environment_allowlist_is_case_insensitive_for_windows() {
+        assert!(is_allowed_environment_key("Path"));
+        assert!(is_allowed_environment_key("SystemRoot"));
+        assert!(is_allowed_environment_key("UserProfile"));
+        assert!(is_allowed_environment_key("lc_messages"));
+        assert!(!is_allowed_environment_key("SSH_ASKPASS"));
     }
 
     #[test]

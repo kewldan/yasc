@@ -32,15 +32,5 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Probe Windows OpenSSH compatibility
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Get-Command ssh | Format-List Source, Version
-          & ssh -V
-          & ssh -G -F NUL -o StrictHostKeyChecking=yes -p 2200 -l integration example.com 2>&1 | Select-Object -First 20
-          Write-Host "OpenSSH probe exit code: $LASTEXITCODE"
-          exit 0
-
       - name: Test workspace
         run: cargo test --workspace --locked
