@@ -6,7 +6,9 @@ use clap::{Args, Parser, Subcommand};
 use thiserror::Error;
 use yasc_domain::{Host, HostId, SshTarget};
 use yasc_platform::{PlatformError, PlatformPaths};
-use yasc_ssh::ConnectionPlan;
+use yasc_ssh::{
+    ConnectionPlan, HostKeyPolicy, OpenSshEngine, OpenSshError, OpenSshRequest, SshEngine,
+};
 use yasc_storage::{SqliteStorage, StorageError};
 
 #[derive(Debug, Parser)]
@@ -23,6 +25,8 @@ struct Cli {
 enum Command {
     /// Inspect a normalized direct connection plan without connecting.
     Inspect(InspectArgs),
+    /// Open an interactive direct SSH session using the controlled OpenSSH adapter.
+    Connect(ConnectArgs),
     /// Manage the local host inventory.
     Host {
         #[command(subcommand)]
@@ -34,9 +38,52 @@ enum Command {
 struct InspectArgs {
     /// SSH destination in [user@]host[:port] form.
     target: SshTarget,
+    /// Evaluate the target through the installed OpenSSH client (`ssh -G`).
+    #[arg(long)]
+    effective: bool,
     /// Print machine-readable JSON.
     #[arg(long)]
     json: bool,
+    #[command(flatten)]
+    openssh: OpenSshArgs,
+}
+
+#[derive(Debug, Args)]
+struct ConnectArgs {
+    /// SSH destination in [user@]host[:port] form.
+    target: SshTarget,
+    #[command(flatten)]
+    openssh: OpenSshArgs,
+}
+
+#[derive(Debug, Args)]
+struct OpenSshArgs {
+    /// Explicit OpenSSH configuration file. Defaults to no configuration file.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Explicit private-key path passed to OpenSSH with IdentitiesOnly enabled.
+    #[arg(long, value_name = "PATH")]
+    identity: Option<PathBuf>,
+    /// Trust a previously unseen host key, while still rejecting changed keys.
+    #[arg(long)]
+    accept_new: bool,
+    /// OpenSSH executable or absolute path.
+    #[arg(long, default_value = "ssh", value_name = "PATH")]
+    ssh_binary: PathBuf,
+}
+
+impl OpenSshArgs {
+    fn request(&self, target: SshTarget) -> OpenSshRequest {
+        let mut request = OpenSshRequest::new(target);
+        request.config_file = self.config.clone();
+        request.identity_file = self.identity.clone();
+        request.host_key_policy = if self.accept_new {
+            HostKeyPolicy::AcceptNew
+        } else {
+            HostKeyPolicy::Strict
+        };
+        request
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -97,13 +144,40 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Inspect(args) => {
-            let plan = ConnectionPlan::direct(args.target);
+            let request = args.openssh.request(args.target.clone());
+            let engine = OpenSshEngine::new(&args.openssh.ssh_binary);
+            let effective_config = args
+                .effective
+                .then(|| engine.effective_config(&request))
+                .transpose()?
+                .map(|config| config.redacted_entries());
+            let plan = if args.effective {
+                request.plan()
+            } else {
+                ConnectionPlan::direct(args.target)
+            };
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&plan)?);
+                if let Some(effective_config) = effective_config {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "plan": plan,
+                            "effective_config": effective_config,
+                        }))?
+                    );
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&plan)?);
+                }
             } else {
                 println!("Connection plan");
                 println!("  mode: direct");
-                println!("  engine: native-rust");
+                println!(
+                    "  engine: {}",
+                    match plan.engine {
+                        SshEngine::NativeRust => "native-rust (planned)",
+                        SshEngine::OpenSshCompatibility => "openssh-compatibility",
+                    }
+                );
                 println!("  target: {}", plan.target);
                 println!("  host: {}", plan.target.host());
                 println!("  port: {}", plan.target.port());
@@ -113,6 +187,24 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 );
                 println!("  credential: <not selected>");
                 println!("  network: not contacted");
+                if let Some(effective_config) = effective_config {
+                    println!("Effective OpenSSH configuration");
+                    for entry in effective_config {
+                        println!("  {}: {}", entry.key, entry.value);
+                    }
+                }
+            }
+        }
+        Command::Connect(args) => {
+            let engine = OpenSshEngine::new(&args.openssh.ssh_binary);
+            let request = args.openssh.request(args.target);
+            let plan = request.plan();
+            eprintln!("YASC direct session via OpenSSH compatibility engine");
+            eprintln!("Target: {}", plan.target);
+            eprintln!("Host-key policy: {:?}", request.host_key_policy);
+            let status = engine.connect(&request)?;
+            if !status.success() {
+                return Err(CliError::SshExit(status.code()));
             }
         }
         Command::Host { command } => run_host_command(cli.database, command)?,
@@ -218,9 +310,13 @@ enum CliError {
     #[error(transparent)]
     Platform(#[from] PlatformError),
     #[error(transparent)]
+    OpenSsh(#[from] OpenSshError),
+    #[error(transparent)]
     InvalidHost(#[from] yasc_domain::HostError),
     #[error("host {0} was not found")]
     HostNotFound(HostId),
     #[error("host tags cannot be empty")]
     EmptyTag,
+    #[error("OpenSSH session exited with status {0:?}")]
+    SshExit(Option<i32>),
 }

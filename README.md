@@ -38,6 +38,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p yasc-cli -- inspect admin@example.com:2222
 cargo run -p yasc-cli -- inspect --json 'admin@[2001:db8::10]:2222'
+cargo run -p yasc-cli -- inspect --effective admin@example.com
+cargo run -p yasc-cli -- connect --config ~/.ssh/config admin@example.com
 cargo run -p yasc-cli -- --database ./yasc.db host add production admin@example.com \
   --tag linux --tag production --environment production
 cargo run -p yasc-cli -- --database ./yasc.db host list

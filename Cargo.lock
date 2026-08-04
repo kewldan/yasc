@@ -948,6 +948,7 @@ name = "yasc-ssh"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "thiserror",
  "yasc-domain",
 ]
 

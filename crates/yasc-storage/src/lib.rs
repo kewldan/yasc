@@ -12,7 +12,7 @@ use yasc_vault::{
     VaultStoreError,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 struct Migration {
     version: u32,
@@ -86,6 +86,15 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX vault_secrets_credential_idx
                 ON vault_secrets(credential_id, kind)
                 WHERE deleted_at_unix IS NULL;
+        "#,
+    },
+    Migration {
+        version: 3,
+        name: "explicit_host_port",
+        sql: r#"
+            ALTER TABLE hosts
+                ADD COLUMN port_explicit INTEGER NOT NULL DEFAULT 0
+                CHECK (port_explicit IN (0, 1));
         "#,
     },
 ];
@@ -309,12 +318,13 @@ impl SqliteStorage {
         transaction.execute(
             r#"
                 INSERT INTO hosts (
-                    id, label, hostname, port, username, environment
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    id, label, hostname, port, port_explicit, username, environment
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 ON CONFLICT(id) DO UPDATE SET
                     label = excluded.label,
                     hostname = excluded.hostname,
                     port = excluded.port,
+                    port_explicit = excluded.port_explicit,
                     username = excluded.username,
                     environment = excluded.environment,
                     revision = hosts.revision + 1,
@@ -326,6 +336,7 @@ impl SqliteStorage {
                 host.label,
                 host.target.host(),
                 host.target.port(),
+                host.target.port_is_explicit(),
                 host.target.username(),
                 host.environment,
             ],
@@ -349,7 +360,7 @@ impl SqliteStorage {
             .connection
             .query_row(
                 r#"
-                    SELECT id, label, hostname, port, username, environment
+                    SELECT id, label, hostname, port, port_explicit, username, environment
                     FROM hosts
                     WHERE id = ?1 AND deleted_at_unix IS NULL
                 "#,
@@ -364,7 +375,7 @@ impl SqliteStorage {
     pub fn list_hosts(&self) -> Result<Vec<Host>, StorageError> {
         let mut statement = self.connection.prepare(
             r#"
-                SELECT id, label, hostname, port, username, environment
+                SELECT id, label, hostname, port, port_explicit, username, environment
                 FROM hosts
                 WHERE deleted_at_unix IS NULL
                 ORDER BY label COLLATE NOCASE, id
@@ -399,8 +410,13 @@ impl SqliteStorage {
             .map_err(|error| StorageError::CorruptData(error.to_string()))?;
         let port = u16::try_from(stored.port)
             .map_err(|error| StorageError::CorruptData(error.to_string()))?;
-        let target = format_target(stored.username.as_deref(), &stored.hostname, port)
-            .parse::<SshTarget>()?;
+        let target = format_target(
+            stored.username.as_deref(),
+            &stored.hostname,
+            port,
+            stored.port_explicit,
+        )
+        .parse::<SshTarget>()?;
         let tags = self.load_tags(id)?;
 
         Host::restore(id, stored.label, target, tags, stored.environment)
@@ -423,6 +439,7 @@ struct StoredHost {
     label: String,
     hostname: String,
     port: i64,
+    port_explicit: bool,
     username: Option<String>,
     environment: Option<String>,
 }
@@ -434,20 +451,25 @@ impl StoredHost {
             label: row.get(1)?,
             hostname: row.get(2)?,
             port: row.get(3)?,
-            username: row.get(4)?,
-            environment: row.get(5)?,
+            port_explicit: row.get(4)?,
+            username: row.get(5)?,
+            environment: row.get(6)?,
         })
     }
 }
 
-fn format_target(username: Option<&str>, hostname: &str, port: u16) -> String {
+fn format_target(username: Option<&str>, hostname: &str, port: u16, port_explicit: bool) -> String {
     let username = username.map_or_else(String::new, |value| format!("{value}@"));
     let hostname = if hostname.contains(':') {
         format!("[{hostname}]")
     } else {
         hostname.to_owned()
     };
-    format!("{username}{hostname}:{port}")
+    if port_explicit {
+        format!("{username}{hostname}:{port}")
+    } else {
+        format!("{username}{hostname}")
+    }
 }
 
 #[derive(Debug, Error)]
@@ -502,6 +524,52 @@ mod tests {
                 .unwrap(),
             CURRENT_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn upgrades_version_two_hosts_without_forcing_port_override() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("version-two.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (\
+                    version INTEGER PRIMARY KEY NOT NULL, \
+                    name TEXT NOT NULL, \
+                    applied_at_unix INTEGER NOT NULL DEFAULT (unixepoch())\
+                );",
+            )
+            .unwrap();
+        for migration in MIGRATIONS.iter().filter(|migration| migration.version <= 2) {
+            connection.execute_batch(migration.sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations(version, name) VALUES (?1, ?2)",
+                    params![migration.version, migration.name],
+                )
+                .unwrap();
+            connection
+                .pragma_update(None, "user_version", migration.version)
+                .unwrap();
+        }
+        let id = HostId::new();
+        connection
+            .execute(
+                r#"
+                    INSERT INTO hosts(id, label, hostname, port)
+                    VALUES (?1, 'Legacy host', 'legacy.example.com', 22)
+                "#,
+                [id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let storage = SqliteStorage::open(&path).unwrap();
+        let restored = storage.find_host(id).unwrap().unwrap();
+
+        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        assert_eq!(restored.target.port(), 22);
+        assert!(!restored.target.port_is_explicit());
     }
 
     #[test]

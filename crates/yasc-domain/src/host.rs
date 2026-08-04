@@ -43,6 +43,8 @@ impl FromStr for HostId {
 pub struct SshTarget {
     host: String,
     port: u16,
+    #[serde(default, skip_serializing)]
+    port_explicit: bool,
     username: Option<String>,
 }
 
@@ -55,6 +57,11 @@ impl SshTarget {
     #[must_use]
     pub const fn port(&self) -> u16 {
         self.port
+    }
+
+    #[must_use]
+    pub const fn port_is_explicit(&self) -> bool {
+        self.port_explicit
     }
 
     #[must_use]
@@ -75,7 +82,7 @@ impl fmt::Display for SshTarget {
             formatter.write_str(&self.host)?;
         }
 
-        if self.port != DEFAULT_SSH_PORT {
+        if self.port_explicit || self.port != DEFAULT_SSH_PORT {
             write!(formatter, ":{}", self.port)?;
         }
 
@@ -104,16 +111,17 @@ impl FromStr for SshTarget {
             None => (None, input),
         };
 
-        let (host, port) = parse_host_and_port(host_and_port)?;
+        let (host, port, port_explicit) = parse_host_and_port(host_and_port)?;
         Ok(Self {
             host: host.to_owned(),
             port,
+            port_explicit,
             username,
         })
     }
 }
 
-fn parse_host_and_port(value: &str) -> Result<(&str, u16), TargetParseError> {
+fn parse_host_and_port(value: &str) -> Result<(&str, u16, bool), TargetParseError> {
     if value.is_empty() {
         return Err(TargetParseError::MissingHost);
     }
@@ -128,16 +136,19 @@ fn parse_host_and_port(value: &str) -> Result<(&str, u16), TargetParseError> {
         }
 
         let suffix = &bracketed[closing + 1..];
-        let port = if suffix.is_empty() {
-            DEFAULT_SSH_PORT
+        let (port, port_explicit) = if suffix.is_empty() {
+            (DEFAULT_SSH_PORT, false)
         } else {
-            parse_port(
-                suffix
-                    .strip_prefix(':')
-                    .ok_or(TargetParseError::UnexpectedSuffix)?,
-            )?
+            (
+                parse_port(
+                    suffix
+                        .strip_prefix(':')
+                        .ok_or(TargetParseError::UnexpectedSuffix)?,
+                )?,
+                true,
+            )
         };
-        return Ok((host, port));
+        return Ok((host, port, port_explicit));
     }
 
     if value.matches(':').count() == 1 {
@@ -145,10 +156,10 @@ fn parse_host_and_port(value: &str) -> Result<(&str, u16), TargetParseError> {
         if host.is_empty() {
             return Err(TargetParseError::MissingHost);
         }
-        return Ok((host, parse_port(port)?));
+        return Ok((host, parse_port(port)?, true));
     }
 
-    Ok((value, DEFAULT_SSH_PORT))
+    Ok((value, DEFAULT_SSH_PORT, false))
 }
 
 fn parse_port(value: &str) -> Result<u16, TargetParseError> {
@@ -244,6 +255,7 @@ mod tests {
         assert_eq!(target.username(), Some("deploy"));
         assert_eq!(target.host(), "example.com");
         assert_eq!(target.port(), 2222);
+        assert!(target.port_is_explicit());
         assert_eq!(target.to_string(), "deploy@example.com:2222");
     }
 
@@ -262,6 +274,7 @@ mod tests {
 
         assert_eq!(target.host(), "2001:db8::10");
         assert_eq!(target.port(), DEFAULT_SSH_PORT);
+        assert!(!target.port_is_explicit());
         assert_eq!(target.to_string(), "[2001:db8::10]");
     }
 
