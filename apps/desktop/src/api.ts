@@ -51,6 +51,22 @@ export type SftpUploadResult = {
   bytesWritten: number;
 };
 
+export type LocalForward = {
+  id: string;
+  hostId: string;
+  credentialId: string;
+  localAddress: string;
+  remoteHost: string;
+  remotePort: number;
+  hostKeyStatus: string;
+  acceptedConnections: number;
+  activeConnections: number;
+  bytesFromLocal: number;
+  bytesToLocal: number;
+  failedConnections: number;
+  running: boolean;
+};
+
 export type TerminalEvent =
   | { type: "data"; stream: "stdout" | "stderr"; data: number[] }
   | { type: "exit"; status: number }
@@ -199,4 +215,28 @@ export async function uploadSftpFile(
     remotePath,
     contents: Array.from(contents),
   });
+}
+
+export async function listLocalForwards(): Promise<LocalForward[]> {
+  return isDesktop ? invoke<LocalForward[]>("list_local_forwards") : [];
+}
+
+export async function startLocalForward(
+  hostId: string,
+  credentialId: string,
+  localPort: number,
+  remoteHost: string,
+  remotePort: number,
+): Promise<LocalForward> {
+  return invoke<LocalForward>("start_local_forward", {
+    hostId,
+    credentialId,
+    localPort,
+    remoteHost,
+    remotePort,
+  });
+}
+
+export async function stopLocalForward(forwardId: string): Promise<LocalForward> {
+  return invoke<LocalForward>("stop_local_forward", { forwardId });
 }

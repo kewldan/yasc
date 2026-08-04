@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
-import type { CredentialSummary, Host } from "./api";
+import type { CredentialSummary, Host, LocalForward } from "./api";
 import {
   credentialsForHost,
+  formatBytes,
   formatTarget,
   hostInitial,
+  localForwardsForHost,
   remoteChild,
   remoteParent,
+  validTunnelPorts,
 } from "./model";
 
 const host: Host = {
@@ -63,5 +66,40 @@ describe("desktop view model", () => {
   it("uses a stable host initial", () => {
     expect(hostInitial(host)).toBe("P");
     expect(hostInitial({ ...host, label: "  " })).toBe(">");
+  });
+
+  it("formats tunnel traffic at stable binary boundaries", () => {
+    expect(formatBytes(1_023)).toBe("1023 B");
+    expect(formatBytes(1_024)).toBe("1.0 KiB");
+    expect(formatBytes(1_048_576)).toBe("1.0 MiB");
+  });
+
+  it("filters local forwards by their inventory host", () => {
+    const base: LocalForward = {
+      id: "forward-1",
+      hostId: "host-1",
+      credentialId: "credential-1",
+      localAddress: "127.0.0.1:49152",
+      remoteHost: "database.internal",
+      remotePort: 5432,
+      hostKeyStatus: "AcceptKnown",
+      acceptedConnections: 1,
+      activeConnections: 0,
+      bytesFromLocal: 4,
+      bytesToLocal: 4,
+      failedConnections: 0,
+      running: true,
+    };
+    expect(localForwardsForHost([base, { ...base, id: "forward-2", hostId: "host-2" }], "host-1"))
+      .toEqual([base]);
+    expect(localForwardsForHost([base], null)).toEqual([]);
+  });
+
+  it("accepts automatic local ports but rejects invalid destination ports", () => {
+    expect(validTunnelPorts(0, 443)).toBe(true);
+    expect(validTunnelPorts(65_535, 65_535)).toBe(true);
+    expect(validTunnelPorts(-1, 443)).toBe(false);
+    expect(validTunnelPorts(8080, 0)).toBe(false);
+    expect(validTunnelPorts(8080.5, 443)).toBe(false);
   });
 });

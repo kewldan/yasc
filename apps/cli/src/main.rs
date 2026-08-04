@@ -4,6 +4,7 @@ use std::{
     collections::BTreeSet,
     env, fs,
     io::{self, IsTerminal, Read, Write},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::ExitCode,
     time::Duration,
@@ -22,11 +23,13 @@ use yasc_domain::{
 };
 use yasc_platform::{PlatformError, PlatformPaths};
 use yasc_ssh::{
-    ConnectionPlan, HostKeyPolicy as OpenSshHostKeyPolicy, NativeAgentCommandRequest,
-    NativeAgentSftpRequest, NativeAgentShellRequest, NativeCommandRequest, NativeSftpRequest,
-    NativeSftpSession, NativeShellIo, NativeShellRequest, NativeSshEngine, NativeSshError,
-    OpenSshEngine, OpenSshError, OpenSshRequest, SshEngine, TerminalSize, connect_agent,
-    external_key_fingerprint, list_agent_identities, validate_private_key,
+    ConnectionPlan, HostKeyPolicy as OpenSshHostKeyPolicy, LocalForwardSpec,
+    NativeAgentCommandRequest, NativeAgentLocalForwardRequest, NativeAgentSftpRequest,
+    NativeAgentShellRequest, NativeCommandRequest, NativeLocalForwardRequest,
+    NativeLocalForwardSession, NativeSftpRequest, NativeSftpSession, NativeShellIo,
+    NativeShellRequest, NativeSshEngine, NativeSshError, OpenSshEngine, OpenSshError,
+    OpenSshRequest, SshEngine, TerminalSize, connect_agent, external_key_fingerprint,
+    list_agent_identities, validate_private_key,
 };
 use yasc_storage::{SqliteStorage, StorageError};
 use yasc_vault::{EncryptedVault, SecretBytes, SecretKind, VaultBackend, VaultError};
@@ -55,6 +58,11 @@ enum Command {
     Sftp {
         #[command(subcommand)]
         command: SftpCommand,
+    },
+    /// Manage SSH tunnels through the native engine.
+    Tunnel {
+        #[command(subcommand)]
+        command: TunnelCommand,
     },
     /// Manage the local host inventory.
     Host {
@@ -93,8 +101,14 @@ enum SftpCommand {
     Upload(SftpUploadArgs),
 }
 
+#[derive(Debug, Subcommand)]
+enum TunnelCommand {
+    /// Forward a loopback TCP port to a destination reachable from the SSH server.
+    Local(LocalTunnelArgs),
+}
+
 #[derive(Debug, Args)]
-struct SftpAuthenticationArgs {
+struct NativeAuthenticationArgs {
     /// Inventory host identifier. The host target must include a username.
     host_id: HostId,
     /// Private key in an OpenSSH, PKCS#8, PEM, or supported PuTTY text format.
@@ -114,7 +128,7 @@ struct SftpAuthenticationArgs {
 #[derive(Debug, Args)]
 struct SftpListArgs {
     #[command(flatten)]
-    authentication: SftpAuthenticationArgs,
+    authentication: NativeAuthenticationArgs,
     /// Remote directory path.
     #[arg(default_value = ".")]
     remote_path: String,
@@ -129,7 +143,7 @@ struct SftpListArgs {
 #[derive(Debug, Args)]
 struct SftpDownloadArgs {
     #[command(flatten)]
-    authentication: SftpAuthenticationArgs,
+    authentication: NativeAuthenticationArgs,
     /// Remote file path.
     remote_path: String,
     /// New local destination path. Existing files are never replaced.
@@ -142,7 +156,7 @@ struct SftpDownloadArgs {
 #[derive(Debug, Args)]
 struct SftpUploadArgs {
     #[command(flatten)]
-    authentication: SftpAuthenticationArgs,
+    authentication: NativeAuthenticationArgs,
     /// Existing local source path.
     local_path: PathBuf,
     /// New remote destination path. Existing files are never replaced.
@@ -150,6 +164,22 @@ struct SftpUploadArgs {
     /// Maximum accepted local file size.
     #[arg(long, default_value_t = 104_857_600)]
     max_bytes: usize,
+}
+
+#[derive(Debug, Args)]
+struct LocalTunnelArgs {
+    #[command(flatten)]
+    authentication: NativeAuthenticationArgs,
+    /// Local loopback address. Non-loopback addresses are rejected.
+    #[arg(long, default_value = "127.0.0.1", value_name = "IP")]
+    bind_address: IpAddr,
+    /// Local TCP port. Use 0 to let the operating system allocate an available port.
+    #[arg(long, default_value_t = 0, value_name = "PORT")]
+    local_port: u16,
+    /// Destination host as resolved from the SSH server.
+    remote_host: String,
+    /// Destination TCP port.
+    remote_port: u16,
 }
 
 #[derive(Debug, Args)]
@@ -625,6 +655,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Exec(args) => run_native_exec(cli.database, args).await?,
         Command::Shell(args) => run_native_shell(cli.database, args).await?,
         Command::Sftp { command } => run_sftp_command(cli.database, command).await?,
+        Command::Tunnel { command } => run_tunnel_command(cli.database, command).await?,
         Command::Host { command } => run_host_command(cli.database, command)?,
         Command::HostKey { command } => run_host_key_command(cli.database, command).await?,
         Command::Vault { command } => run_vault_command(cli.database, command)?,
@@ -1139,9 +1170,94 @@ async fn run_sftp_command(database: Option<PathBuf>, command: SftpCommand) -> Re
     Ok(())
 }
 
+async fn run_tunnel_command(
+    database: Option<PathBuf>,
+    command: TunnelCommand,
+) -> Result<(), CliError> {
+    match command {
+        TunnelCommand::Local(args) => {
+            let spec = LocalForwardSpec::new(
+                SocketAddr::new(args.bind_address, args.local_port),
+                args.remote_host,
+                args.remote_port,
+            )?;
+            let session = connect_cli_local_forward(database, args.authentication, spec).await?;
+            let snapshot = session.snapshot();
+            println!(
+                "Local forward {} -> {}:{}",
+                snapshot.local_address, snapshot.remote_host, snapshot.remote_port
+            );
+            println!("Host key: {:?}", snapshot.host_key_decision);
+            println!("Press Ctrl-C to stop");
+            tokio::signal::ctrl_c().await?;
+            let stopped = session.shutdown().await?;
+            println!(
+                "Stopped: {} connections, {} bytes sent, {} bytes received, {} failures",
+                stopped.accepted_connections,
+                stopped.bytes_from_local,
+                stopped.bytes_to_local,
+                stopped.failed_connections
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn connect_cli_local_forward(
+    database: Option<PathBuf>,
+    authentication: NativeAuthenticationArgs,
+    spec: LocalForwardSpec,
+) -> Result<NativeLocalForwardSession, CliError> {
+    let storage = open_storage(database)?;
+    let host = storage
+        .find_host(authentication.host_id)?
+        .ok_or(CliError::HostNotFound(authentication.host_id))?;
+    let username = host
+        .target
+        .username()
+        .ok_or(CliError::NativeUsernameRequired)?
+        .to_owned();
+    let history = storage.load_host_key_history(authentication.host_id)?;
+    let resolved = resolve_native_authentication(
+        storage,
+        authentication.host_id,
+        authentication.identity.as_deref(),
+        authentication.credential,
+        authentication.vault_password_file.as_deref(),
+        authentication.passphrase_file.as_deref(),
+    )?;
+    let engine = NativeSshEngine::default();
+    match resolved {
+        ResolvedNativeAuthentication::PrivateKey {
+            private_key,
+            passphrase,
+        } => {
+            let mut request =
+                NativeLocalForwardRequest::new(host.target, username, private_key, spec)?;
+            if let Some(passphrase) = passphrase {
+                request = request.with_passphrase(passphrase);
+            }
+            Ok(engine
+                .start_local_forward(request, &history, &HostKeyPolicy::strict())
+                .await?)
+        }
+        ResolvedNativeAuthentication::Agent {
+            provider,
+            external_key,
+        } => {
+            let request =
+                NativeAgentLocalForwardRequest::new(host.target, username, external_key, spec)?;
+            let mut agent = connect_agent(provider).await?;
+            Ok(engine
+                .start_agent_local_forward(request, &mut agent, &history, &HostKeyPolicy::strict())
+                .await?)
+        }
+    }
+}
+
 async fn connect_cli_sftp(
     database: Option<PathBuf>,
-    authentication: SftpAuthenticationArgs,
+    authentication: NativeAuthenticationArgs,
 ) -> Result<NativeSftpSession, CliError> {
     let storage = open_storage(database)?;
     let host = storage
@@ -1903,6 +2019,39 @@ mod tests {
                     ..
                 })
             } if remote_path == "/remote/report.txt"
+        ));
+    }
+
+    #[test]
+    fn local_tunnel_parses_loopback_and_destination_arguments() {
+        let host_id = HostId::new();
+        let cli = Cli::try_parse_from([
+            "yasc",
+            "tunnel",
+            "local",
+            &host_id.to_string(),
+            "--credential",
+            &CredentialId::new().to_string(),
+            "--bind-address",
+            "::1",
+            "--local-port",
+            "8080",
+            "database.internal",
+            "5432",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Tunnel {
+                command: TunnelCommand::Local(LocalTunnelArgs {
+                    bind_address,
+                    local_port: 8080,
+                    remote_host,
+                    remote_port: 5432,
+                    ..
+                })
+            } if bind_address == "::1".parse::<IpAddr>().unwrap()
+                && remote_host == "database.internal"
         ));
     }
 

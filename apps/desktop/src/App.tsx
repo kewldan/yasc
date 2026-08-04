@@ -1,6 +1,13 @@
 import { ChangeEvent, FormEvent, MouseEvent, useCallback, useEffect, useMemo, useState } from "react";
 import TerminalPane from "./TerminalPane";
-import type { AgentIdentity, CredentialSummary, Host, HostKeyProbe, SftpEntry } from "./api";
+import type {
+  AgentIdentity,
+  CredentialSummary,
+  Host,
+  HostKeyProbe,
+  LocalForward,
+  SftpEntry,
+} from "./api";
 import {
   addHost,
   desktopAvailable,
@@ -8,19 +15,31 @@ import {
   listAgentIdentities,
   listCredentials,
   listHosts,
+  listLocalForwards,
   listSftpDirectory,
   probeHostKey,
   readSftpFile,
+  startLocalForward,
+  stopLocalForward,
   trustHostKey,
   uploadSftpFile,
 } from "./api";
-import { credentialsForHost, formatTarget, hostInitial, remoteChild, remoteParent } from "./model";
+import {
+  credentialsForHost,
+  formatBytes,
+  formatTarget,
+  hostInitial,
+  localForwardsForHost,
+  remoteChild,
+  remoteParent,
+  validTunnelPorts,
+} from "./model";
 
 const SFTP_PREVIEW_LIMIT = 1_048_576;
 const SFTP_UPLOAD_LIMIT = 10 * 1024 * 1024;
 
 type AppView = "home" | "session";
-type SessionMode = "ssh" | "sftp";
+type SessionMode = "ssh" | "sftp" | "tunnels";
 
 export default function App() {
   const [hosts, setHosts] = useState<Host[]>([]);
@@ -39,6 +58,7 @@ export default function App() {
   const [sftpPath, setSftpPath] = useState("/");
   const [sftpEntries, setSftpEntries] = useState<SftpEntry[]>([]);
   const [sftpPreview, setSftpPreview] = useState<{ path: string; text: string } | null>(null);
+  const [localForwards, setLocalForwards] = useState<LocalForward[]>([]);
   const [busy, setBusy] = useState(false);
 
   const selectedHost = hosts.find((host) => host.id === selectedHostId) ?? null;
@@ -50,6 +70,10 @@ export default function App() {
     availableCredentials.find((credential) => credential.id === selectedCredentialId) ??
     availableCredentials[0] ??
     null;
+  const visibleLocalForwards = useMemo(
+    () => localForwardsForHost(localForwards, selectedHostId),
+    [localForwards, selectedHostId],
+  );
   const filteredHosts = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
     if (!query) return hosts;
@@ -92,6 +116,20 @@ export default function App() {
     return () => window.removeEventListener("keydown", dismissModal);
   }, [agentIdentities, showAddHost]);
 
+  const refreshLocalForwards = useCallback(async () => {
+    const forwards = await listLocalForwards();
+    setLocalForwards(forwards);
+    return forwards;
+  }, []);
+
+  useEffect(() => {
+    if (view !== "session" || sessionMode !== "tunnels" || !desktopAvailable) return;
+    const timer = window.setInterval(() => {
+      void refreshLocalForwards().catch((error: unknown) => setStatus(`Tunnels: ${String(error)}`));
+    }, 1_500);
+    return () => window.clearInterval(timer);
+  }, [refreshLocalForwards, sessionMode, view]);
+
   const loadSftpDirectory = async (path: string) => {
     if (!selectedHost || !selectedCredential) return;
     setBusy(true);
@@ -113,12 +151,22 @@ export default function App() {
     setSessionMode(mode);
     if (mode === "ssh") {
       setConnectSignal((value) => value + 1);
-    } else {
+    } else if (mode === "sftp") {
       await loadSftpDirectory("/");
+    } else {
+      const forwards = await refreshLocalForwards();
+      setStatus(`${forwards.filter((forward) => forward.running).length} local forward(s) running`);
     }
   };
 
   const openMode = async (mode: SessionMode) => {
+    if (!desktopAvailable) {
+      setView("session");
+      setSessionMode(mode);
+      if (mode === "tunnels") await refreshLocalForwards();
+      setStatus("Browser preview — native actions are disabled");
+      return;
+    }
     if (!selectedHost || !selectedCredential) {
       setStatus("Register an agent key for this host before connecting.");
       return;
@@ -259,6 +307,49 @@ export default function App() {
     }
   };
 
+  const createLocalForward = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedHost || !selectedCredential) return;
+    const form = new FormData(event.currentTarget);
+    const localPort = Number(form.get("localPort"));
+    const remotePort = Number(form.get("remotePort"));
+    const remoteHost = String(form.get("remoteHost") ?? "").trim();
+    if (!validTunnelPorts(localPort, remotePort)) {
+      setStatus("Tunnel ports must be valid TCP ports; local port may be 0 for automatic allocation.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const forward = await startLocalForward(
+        selectedHost.id,
+        selectedCredential.id,
+        localPort,
+        remoteHost,
+        remotePort,
+      );
+      setLocalForwards((current) => [...current, forward]);
+      setStatus(`Forwarding ${forward.localAddress} to ${forward.remoteHost}:${forward.remotePort}`);
+      event.currentTarget.reset();
+    } catch (error) {
+      setStatus(`Tunnel: ${String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const stopForward = async (forwardId: string) => {
+    setBusy(true);
+    try {
+      const stopped = await stopLocalForward(forwardId);
+      setLocalForwards((current) => current.filter((forward) => forward.id !== forwardId));
+      setStatus(`Stopped ${stopped.localAddress} after ${stopped.acceptedConnections} connection(s)`);
+    } catch (error) {
+      setStatus(`Tunnel: ${String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const selectHost = (host: Host) => {
     setSelectedHostId(host.id);
     setStatus(`${host.label} selected`);
@@ -302,7 +393,11 @@ export default function App() {
         <nav>
           <button className="nav-item active"><span>▤</span> Hosts</button>
           <button className="nav-item" disabled><span>◇</span> Keychain <small>Soon</small></button>
-          <button className="nav-item" disabled><span>⇄</span> Tunnels <small>Soon</small></button>
+          <button
+            className={`nav-item ${view === "session" && sessionMode === "tunnels" ? "active" : ""}`}
+            onClick={() => void openMode("tunnels")}
+            disabled={!selectedHost || busy}
+          ><span>⇄</span> Tunnels</button>
           <button className="nav-item" disabled><span>⌁</span> Snippets <small>Soon</small></button>
         </nav>
         <div className="nav-bottom">
@@ -395,11 +490,15 @@ export default function App() {
               <button
                 className={sessionMode === "sftp" ? "active" : ""}
                 onClick={() => void openMode("sftp")}
-                disabled={busy || !desktopAvailable}
+                disabled={busy}
               >
                 <span>▱</span> SFTP
               </button>
-              <button disabled><span>⇄</span> Tunnels</button>
+              <button
+                className={sessionMode === "tunnels" ? "active" : ""}
+                onClick={() => void openMode("tunnels")}
+                disabled={busy}
+              ><span>⇄</span> Tunnels</button>
             </div>
             <div className="session-actions">
               <label className="credential-select">
@@ -451,7 +550,7 @@ export default function App() {
               connectSignal={connectSignal}
               onStatus={updateStatus}
             />
-          ) : (
+          ) : sessionMode === "sftp" ? (
             <div className="sftp-pane">
               <div className="sftp-toolbar">
                 <div className="path-actions">
@@ -488,6 +587,56 @@ export default function App() {
                     <div className="preview-empty"><span>▱</span><strong>File preview</strong><p>Select a file for a bounded 1 MiB UTF-8 preview.</p></div>
                   )}
                 </div>
+              </div>
+            </div>
+          ) : (
+            <div className="tunnel-pane">
+              <div className="tunnel-heading">
+                <div>
+                  <span className="eyebrow">Native SSH forwarding</span>
+                  <h2>Local tunnels</h2>
+                  <p>Every listener is restricted to 127.0.0.1 and protected by the selected host key and credential grant.</p>
+                </div>
+                <button className="secondary-button" onClick={() => void refreshLocalForwards()} disabled={busy}>
+                  Refresh
+                </button>
+              </div>
+              <form className="tunnel-form" onSubmit={createLocalForward}>
+                <label>
+                  Local port
+                  <input name="localPort" type="number" min="0" max="65535" defaultValue="0" required />
+                  <small>0 selects a free port</small>
+                </label>
+                <span className="tunnel-arrow">→</span>
+                <label>
+                  Remote host
+                  <input name="remoteHost" placeholder="database.internal" required />
+                </label>
+                <label>
+                  Remote port
+                  <input name="remotePort" type="number" min="1" max="65535" defaultValue="5432" required />
+                </label>
+                <button className="connect-button" disabled={busy || !selectedCredential}>Start tunnel</button>
+              </form>
+              <div className="tunnel-list">
+                <div className="tunnel-columns">
+                  <span>Local listener</span><span>Destination</span><span>Traffic</span><span>Connections</span><span>Status</span><span />
+                </div>
+                {visibleLocalForwards.map((forward) => (
+                  <article className="tunnel-row" key={forward.id}>
+                    <code>{forward.localAddress}</code>
+                    <strong>{forward.remoteHost}:{forward.remotePort}</strong>
+                    <span>↑ {formatBytes(forward.bytesFromLocal)} · ↓ {formatBytes(forward.bytesToLocal)}</span>
+                    <span>{forward.activeConnections} active · {forward.acceptedConnections} total</span>
+                    <span className={forward.running ? "tunnel-running" : "tunnel-stopped"}>
+                      <i />{forward.running ? "Running" : "Stopped"}
+                    </span>
+                    <button className="ghost-button" onClick={() => void stopForward(forward.id)} disabled={busy}>Stop</button>
+                  </article>
+                ))}
+                {visibleLocalForwards.length === 0 && (
+                  <div className="preview-empty tunnel-empty"><span>⇄</span><strong>No local tunnels</strong><p>Start one above. The assigned loopback port will appear here.</p></div>
+                )}
               </div>
             </div>
           )}

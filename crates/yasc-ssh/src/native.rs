@@ -1,5 +1,9 @@
 use std::{
+    net::SocketAddr,
+    pin::Pin,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -17,9 +21,13 @@ use russh_sftp::{
 };
 use serde::Serialize;
 use thiserror::Error;
+#[cfg(test)]
+use tokio::io::copy_bidirectional;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy, split},
+    net::{TcpListener, TcpStream},
     sync::watch,
+    task::{JoinHandle, JoinSet},
     time::timeout,
 };
 use uuid::Uuid;
@@ -176,6 +184,154 @@ pub struct NativeAgentSftpRequest {
     external_key: ExternalKeyReference,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalForwardSpec {
+    bind_address: SocketAddr,
+    remote_host: String,
+    remote_port: u16,
+}
+
+impl LocalForwardSpec {
+    pub fn new(
+        bind_address: SocketAddr,
+        remote_host: impl Into<String>,
+        remote_port: u16,
+    ) -> Result<Self, NativeSshError> {
+        if !bind_address.ip().is_loopback() {
+            return Err(NativeSshError::NonLoopbackLocalForwardBind);
+        }
+        if remote_port == 0 {
+            return Err(NativeSshError::InvalidLocalForwardDestination);
+        }
+        let remote_host = remote_host.into();
+        let target_text = if remote_host.contains(':') {
+            format!("[{remote_host}]:{remote_port}")
+        } else {
+            format!("{remote_host}:{remote_port}")
+        };
+        let target = target_text
+            .parse::<SshTarget>()
+            .map_err(|_| NativeSshError::InvalidLocalForwardDestination)?;
+        if target.username().is_some() || target.port() != remote_port {
+            return Err(NativeSshError::InvalidLocalForwardDestination);
+        }
+        Ok(Self {
+            bind_address,
+            remote_host: target.host().to_owned(),
+            remote_port,
+        })
+    }
+
+    #[must_use]
+    pub const fn bind_address(&self) -> SocketAddr {
+        self.bind_address
+    }
+
+    #[must_use]
+    pub fn remote_host(&self) -> &str {
+        &self.remote_host
+    }
+
+    #[must_use]
+    pub const fn remote_port(&self) -> u16 {
+        self.remote_port
+    }
+}
+
+pub struct NativeLocalForwardRequest {
+    target: SshTarget,
+    username: String,
+    private_key: SecretBytes,
+    private_key_passphrase: Option<SecretBytes>,
+    spec: LocalForwardSpec,
+}
+
+pub struct NativeAgentLocalForwardRequest {
+    target: SshTarget,
+    username: String,
+    external_key: ExternalKeyReference,
+    spec: LocalForwardSpec,
+}
+
+impl NativeLocalForwardRequest {
+    pub fn new(
+        target: SshTarget,
+        username: impl Into<String>,
+        private_key: SecretBytes,
+        spec: LocalForwardSpec,
+    ) -> Result<Self, NativeSshError> {
+        let username = username.into();
+        validate_username(&username)?;
+        if private_key.is_empty() {
+            return Err(NativeSshError::EmptyPrivateKey);
+        }
+        Ok(Self {
+            target,
+            username,
+            private_key,
+            private_key_passphrase: None,
+            spec,
+        })
+    }
+
+    #[must_use]
+    pub fn with_passphrase(mut self, passphrase: SecretBytes) -> Self {
+        self.private_key_passphrase = Some(passphrase);
+        self
+    }
+}
+
+impl NativeAgentLocalForwardRequest {
+    pub fn new(
+        target: SshTarget,
+        username: impl Into<String>,
+        external_key: ExternalKeyReference,
+        spec: LocalForwardSpec,
+    ) -> Result<Self, NativeSshError> {
+        let username = username.into();
+        validate_username(&username)?;
+        let public_key = ssh_key::PublicKey::from_bytes(&external_key.public_key_blob)?;
+        if public_key.algorithm().to_string() != external_key.algorithm {
+            return Err(NativeSshError::AgentIdentityNotFound);
+        }
+        Ok(Self {
+            target,
+            username,
+            external_key,
+            spec,
+        })
+    }
+}
+
+impl std::fmt::Debug for NativeLocalForwardRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeLocalForwardRequest")
+            .field("target", &self.target)
+            .field("username", &self.username)
+            .field("private_key", &"[REDACTED]")
+            .field(
+                "private_key_passphrase",
+                &self.private_key_passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("spec", &self.spec)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for NativeAgentLocalForwardRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeAgentLocalForwardRequest")
+            .field("target", &self.target)
+            .field("username", &self.username)
+            .field("external_key", &self.external_key)
+            .field("spec", &self.spec)
+            .finish()
+    }
+}
+
 impl NativeSftpRequest {
     pub fn new(
         target: SshTarget,
@@ -279,6 +435,93 @@ pub struct NativeSftpSession {
     handle: client::Handle<NativeHostKeyHandler>,
     sftp: SftpSession,
     host_key_decision: HostKeyDecision,
+}
+
+#[derive(Debug, Default)]
+struct LocalForwardCounters {
+    accepted_connections: AtomicU64,
+    active_connections: AtomicUsize,
+    bytes_from_local: AtomicU64,
+    bytes_to_local: AtomicU64,
+    failed_connections: AtomicU64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeLocalForwardSnapshot {
+    pub local_address: SocketAddr,
+    pub remote_host: String,
+    pub remote_port: u16,
+    pub host_key_decision: HostKeyDecision,
+    pub accepted_connections: u64,
+    pub active_connections: usize,
+    pub bytes_from_local: u64,
+    pub bytes_to_local: u64,
+    pub failed_connections: u64,
+    pub running: bool,
+}
+
+pub struct NativeLocalForwardSession {
+    local_address: SocketAddr,
+    remote_host: String,
+    remote_port: u16,
+    host_key_decision: HostKeyDecision,
+    counters: Arc<LocalForwardCounters>,
+    shutdown: watch::Sender<bool>,
+    task: Option<JoinHandle<Result<(), NativeSshError>>>,
+}
+
+impl std::fmt::Debug for NativeLocalForwardSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeLocalForwardSession")
+            .field("snapshot", &self.snapshot())
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeLocalForwardSession {
+    #[must_use]
+    pub const fn local_address(&self) -> SocketAddr {
+        self.local_address
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> NativeLocalForwardSnapshot {
+        NativeLocalForwardSnapshot {
+            local_address: self.local_address,
+            remote_host: self.remote_host.clone(),
+            remote_port: self.remote_port,
+            host_key_decision: self.host_key_decision.clone(),
+            accepted_connections: self.counters.accepted_connections.load(Ordering::Relaxed),
+            active_connections: self.counters.active_connections.load(Ordering::Relaxed),
+            bytes_from_local: self.counters.bytes_from_local.load(Ordering::Relaxed),
+            bytes_to_local: self.counters.bytes_to_local.load(Ordering::Relaxed),
+            failed_connections: self.counters.failed_connections.load(Ordering::Relaxed),
+            running: self.task.as_ref().is_some_and(|task| !task.is_finished()),
+        }
+    }
+
+    pub async fn shutdown(mut self) -> Result<NativeLocalForwardSnapshot, NativeSshError> {
+        let _ = self.shutdown.send(true);
+        if let Some(task) = self.task.take() {
+            task.await??;
+        }
+        Ok(self.snapshot())
+    }
+
+    pub async fn wait(mut self) -> Result<NativeLocalForwardSnapshot, NativeSshError> {
+        if let Some(task) = self.task.take() {
+            task.await??;
+        }
+        Ok(self.snapshot())
+    }
+}
+
+impl Drop for NativeLocalForwardSession {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+    }
 }
 
 impl std::fmt::Debug for NativeSftpSession {
@@ -1394,6 +1637,279 @@ impl NativeSshEngine {
         }
         open_sftp_session(handle, probe).await
     }
+
+    /// Starts a loopback-only local TCP listener and relays every accepted connection through an
+    /// authenticated SSH `direct-tcpip` channel. The returned session owns the listener lifecycle.
+    pub async fn start_local_forward(
+        &self,
+        request: NativeLocalForwardRequest,
+        history: &HostKeyHistory,
+        policy: &HostKeyPolicy,
+    ) -> Result<NativeLocalForwardSession, NativeSshError> {
+        let private_key = decode_private_key(
+            &request.private_key,
+            request.private_key_passphrase.as_ref(),
+        )?;
+        let listener = TcpListener::bind(request.spec.bind_address()).await?;
+        let captured = Arc::new(Mutex::new(None));
+        let handler = NativeHostKeyHandler {
+            history: history.clone(),
+            policy: policy.clone(),
+            captured: Arc::clone(&captured),
+        };
+        let config = Arc::new(client::Config::default());
+        let address = (request.target.host().to_owned(), request.target.port());
+        let connect_result = timeout(
+            self.handshake_timeout,
+            client::connect(config, address, handler),
+        )
+        .await
+        .map_err(|_| NativeSshError::HandshakeTimeout)?;
+        let (mut handle, probe) = checked_connection(connect_result, &captured)?;
+        let rsa_hash = handle.best_supported_rsa_hash().await?.flatten();
+        let authentication = handle
+            .authenticate_publickey(
+                request.username,
+                PrivateKeyWithHashAlg::new(Arc::new(private_key), rsa_hash),
+            )
+            .await?;
+        if !authentication.success() {
+            return Err(NativeSshError::AuthenticationRejected);
+        }
+        open_local_forward(handle, probe, listener, request.spec)
+    }
+
+    /// Starts a local TCP forward while keeping signing operations inside an external SSH agent.
+    pub async fn start_agent_local_forward<S>(
+        &self,
+        request: NativeAgentLocalForwardRequest,
+        agent: &mut AgentClient<S>,
+        history: &HostKeyHistory,
+        policy: &HostKeyPolicy,
+    ) -> Result<NativeLocalForwardSession, NativeSshError>
+    where
+        S: russh::keys::agent::client::AgentStream + Send + Unpin,
+    {
+        let public_key = ssh_key::PublicKey::from_bytes(&request.external_key.public_key_blob)?;
+        let identities = agent.request_identities().await?;
+        if !identities.iter().any(|identity| {
+            matches!(identity, AgentIdentity::PublicKey { key, .. } if key == &public_key)
+        }) {
+            return Err(NativeSshError::AgentIdentityNotFound);
+        }
+        let listener = TcpListener::bind(request.spec.bind_address()).await?;
+        let captured = Arc::new(Mutex::new(None));
+        let handler = NativeHostKeyHandler {
+            history: history.clone(),
+            policy: policy.clone(),
+            captured: Arc::clone(&captured),
+        };
+        let config = Arc::new(client::Config::default());
+        let address = (request.target.host().to_owned(), request.target.port());
+        let connect_result = timeout(
+            self.handshake_timeout,
+            client::connect(config, address, handler),
+        )
+        .await
+        .map_err(|_| NativeSshError::HandshakeTimeout)?;
+        let (mut handle, probe) = checked_connection(connect_result, &captured)?;
+        let rsa_hash = handle.best_supported_rsa_hash().await?.flatten();
+        let authentication = handle
+            .authenticate_publickey_with(request.username, public_key, rsa_hash, agent)
+            .await
+            .map_err(NativeSshError::AgentAuthentication)?;
+        if !authentication.success() {
+            return Err(NativeSshError::AuthenticationRejected);
+        }
+        open_local_forward(handle, probe, listener, request.spec)
+    }
+}
+
+fn open_local_forward(
+    handle: client::Handle<NativeHostKeyHandler>,
+    probe: NativeHostKeyProbe,
+    listener: TcpListener,
+    spec: LocalForwardSpec,
+) -> Result<NativeLocalForwardSession, NativeSshError> {
+    let local_address = listener.local_addr()?;
+    let remote_host = spec.remote_host.clone();
+    let remote_port = spec.remote_port;
+    let counters = Arc::new(LocalForwardCounters::default());
+    let (shutdown, shutdown_receiver) = watch::channel(false);
+    let task_counters = Arc::clone(&counters);
+    let task = tokio::spawn(async move {
+        run_local_forward(
+            handle,
+            listener,
+            remote_host,
+            remote_port,
+            shutdown_receiver,
+            task_counters,
+        )
+        .await
+    });
+    Ok(NativeLocalForwardSession {
+        local_address,
+        remote_host: spec.remote_host,
+        remote_port,
+        host_key_decision: probe.decision,
+        counters,
+        shutdown,
+        task: Some(task),
+    })
+}
+
+async fn run_local_forward(
+    handle: client::Handle<NativeHostKeyHandler>,
+    listener: TcpListener,
+    remote_host: String,
+    remote_port: u16,
+    mut shutdown: watch::Receiver<bool>,
+    counters: Arc<LocalForwardCounters>,
+) -> Result<(), NativeSshError> {
+    let mut relays = JoinSet::new();
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            accepted = listener.accept() => {
+                let (socket, originator) = accepted?;
+                counters.accepted_connections.fetch_add(1, Ordering::Relaxed);
+                let channel = tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    channel = handle.channel_open_direct_tcpip(
+                        remote_host.clone(),
+                        u32::from(remote_port),
+                        originator.ip().to_string(),
+                        u32::from(originator.port()),
+                    ) => channel,
+                };
+                match channel {
+                    Ok(channel) => {
+                        counters.active_connections.fetch_add(1, Ordering::Relaxed);
+                        let relay_counters = Arc::clone(&counters);
+                        relays.spawn(async move {
+                            relay_local_connection(socket, channel.into_stream(), relay_counters).await;
+                        });
+                    }
+                    Err(_) => {
+                        counters.failed_connections.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            Some(result) = relays.join_next(), if !relays.is_empty() => {
+                if result.is_err() {
+                    counters.failed_connections.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    let _ = handle
+        .disconnect(Disconnect::ByApplication, "local forward stopped", "en")
+        .await;
+    relays.shutdown().await;
+    Ok(())
+}
+
+async fn relay_local_connection(
+    socket: TcpStream,
+    channel: russh::ChannelStream<russh::client::Msg>,
+    counters: Arc<LocalForwardCounters>,
+) {
+    struct ActiveConnection(Arc<LocalForwardCounters>);
+    impl Drop for ActiveConnection {
+        fn drop(&mut self) {
+            self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    let _active = ActiveConnection(Arc::clone(&counters));
+    let (local_read, mut local_write) = split(socket);
+    let (remote_read, mut remote_write) = split(channel);
+    let mut local_read = CountingReader::new(
+        local_read,
+        Arc::clone(&counters),
+        TrafficDirection::FromLocal,
+    );
+    let mut remote_read = CountingReader::new(
+        remote_read,
+        Arc::clone(&counters),
+        TrafficDirection::ToLocal,
+    );
+    let outbound = async {
+        copy(&mut local_read, &mut remote_write).await?;
+        remote_write.shutdown().await
+    };
+    let inbound = async {
+        copy(&mut remote_read, &mut local_write).await?;
+        local_write.shutdown().await
+    };
+    if tokio::try_join!(outbound, inbound).is_err() {
+        counters.failed_connections.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TrafficDirection {
+    FromLocal,
+    ToLocal,
+}
+
+struct CountingReader<R> {
+    inner: R,
+    counters: Arc<LocalForwardCounters>,
+    direction: TrafficDirection,
+}
+
+impl<R> CountingReader<R> {
+    const fn new(
+        inner: R,
+        counters: Arc<LocalForwardCounters>,
+        direction: TrafficDirection,
+    ) -> Self {
+        Self {
+            inner,
+            counters,
+            direction,
+        }
+    }
+}
+
+impl<R> AsyncRead for CountingReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(context, buffer);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            let read = buffer.filled().len().saturating_sub(before) as u64;
+            match self.direction {
+                TrafficDirection::FromLocal => {
+                    self.counters
+                        .bytes_from_local
+                        .fetch_add(read, Ordering::Relaxed);
+                }
+                TrafficDirection::ToLocal => {
+                    self.counters
+                        .bytes_to_local
+                        .fetch_add(read, Ordering::Relaxed);
+                }
+            }
+        }
+        result
+    }
 }
 
 fn checked_connection(
@@ -1633,8 +2149,10 @@ fn take_probe(
 
 #[derive(Debug, Error)]
 pub enum NativeSshError {
-    #[error("local terminal I/O failed: {0}")]
+    #[error("local I/O failed: {0}")]
     LocalIo(#[from] std::io::Error),
+    #[error("local forward task failed: {0}")]
+    LocalForwardTask(#[from] tokio::task::JoinError),
     #[error("native SSH transport failed: {0}")]
     Transport(#[from] russh::Error),
     #[error("SFTP operation failed: {0}")]
@@ -1677,6 +2195,10 @@ pub enum NativeSshError {
     InvalidSftpEntryLimit,
     #[error("SFTP byte limit must be greater than zero")]
     InvalidSftpByteLimit,
+    #[error("local forwarding listeners must bind to a loopback address")]
+    NonLoopbackLocalForwardBind,
+    #[error("local forwarding destination must be a valid host and non-zero port")]
+    InvalidLocalForwardDestination,
     #[error("SSH private key must use a supported UTF-8 text format")]
     PrivateKeyNotUtf8,
     #[error("SSH private-key passphrase must be UTF-8")]
@@ -2026,6 +2548,30 @@ mod tests {
         ) -> Result<(), Self::Error> {
             self.channels.lock().await.insert(channel.id(), channel);
             reply.accept().await;
+            Ok(())
+        }
+
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            channel: Channel<server::Msg>,
+            host_to_connect: &str,
+            port_to_connect: u32,
+            _: &str,
+            _: u32,
+            reply: ChannelOpenHandle,
+            _: &mut Session,
+        ) -> Result<(), Self::Error> {
+            let Ok(port) = u16::try_from(port_to_connect) else {
+                return Ok(());
+            };
+            let Ok(mut upstream) = TcpStream::connect((host_to_connect, port)).await else {
+                return Ok(());
+            };
+            reply.accept().await;
+            tokio::spawn(async move {
+                let mut channel = channel.into_stream();
+                let _ = copy_bidirectional(&mut upstream, &mut channel).await;
+            });
             Ok(())
         }
 
@@ -2398,6 +2944,245 @@ mod tests {
         assert!(temporary_upload_path("/srv/file.txt").starts_with("/srv/.yasc-upload-"));
         assert!(temporary_upload_path("/file.txt").starts_with("/.yasc-upload-"));
         assert!(temporary_upload_path("file.txt").starts_with(".yasc-upload-"));
+    }
+
+    #[test]
+    fn local_forward_requires_loopback_and_a_safe_destination() {
+        assert!(LocalForwardSpec::new("127.0.0.1:0".parse().unwrap(), "localhost", 443).is_ok());
+        assert!(LocalForwardSpec::new("[::1]:0".parse().unwrap(), "::1", 443).is_ok());
+        assert!(matches!(
+            LocalForwardSpec::new("0.0.0.0:8080".parse().unwrap(), "localhost", 443),
+            Err(NativeSshError::NonLoopbackLocalForwardBind)
+        ));
+        for (host, port) in [
+            ("", 443),
+            ("user@example.com", 443),
+            ("host\nname", 443),
+            ("localhost", 0),
+        ] {
+            assert!(matches!(
+                LocalForwardSpec::new("127.0.0.1:0".parse().unwrap(), host, port),
+                Err(NativeSshError::InvalidLocalForwardDestination)
+            ));
+        }
+
+        let request = NativeLocalForwardRequest::new(
+            "admin@example.com".parse().unwrap(),
+            "admin",
+            SecretBytes::new(b"private fixture value".to_vec()),
+            LocalForwardSpec::new("127.0.0.1:0".parse().unwrap(), "localhost", 443).unwrap(),
+        )
+        .unwrap()
+        .with_passphrase(SecretBytes::new(b"secret passphrase".to_vec()));
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("private fixture value"));
+        assert!(!debug.contains("secret passphrase"));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn local_forward_relays_bytes_and_reports_lifecycle_counters() {
+        let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let server_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let encoded_client_key = client_key.to_openssh(LineEnding::LF).unwrap();
+        let (address, shutdown, task, authentication_attempts) =
+            start_server(server_key.clone(), Some(client_key.public_key().clone())).await;
+        let mut history = HostKeyHistory::new(HostId::new());
+        history
+            .trust_first_use(
+                HostKeyObservation::presented(
+                    HostKeyMaterial::new(
+                        HostKeyAlgorithm::new(server_key.public_key().algorithm().to_string())
+                            .unwrap(),
+                        server_key.public_key().to_bytes().unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                10,
+            )
+            .unwrap();
+        let spec = LocalForwardSpec::new(
+            "127.0.0.1:0".parse().unwrap(),
+            upstream_address.ip().to_string(),
+            upstream_address.port(),
+        )
+        .unwrap();
+        let request = NativeLocalForwardRequest::new(
+            format!("127.0.0.1:{}", address.port())
+                .parse::<SshTarget>()
+                .unwrap(),
+            "fixture-user",
+            SecretBytes::new(encoded_client_key.as_bytes().to_vec()),
+            spec,
+        )
+        .unwrap();
+        let engine = NativeSshEngine::new(Duration::from_secs(5));
+        let session = engine
+            .start_local_forward(request, &history, &HostKeyPolicy::strict())
+            .await
+            .unwrap();
+        assert!(session.local_address().ip().is_loopback());
+        assert_ne!(session.local_address().port(), 0);
+
+        let mut client = TcpStream::connect(session.local_address()).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut response = [0_u8; 4];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
+        drop(client);
+        upstream_task.await.unwrap();
+
+        for _ in 0..50 {
+            let snapshot = session.snapshot();
+            if snapshot.bytes_to_local >= 4 && snapshot.active_connections == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let running = session.snapshot();
+        assert!(running.running);
+        assert_eq!(running.accepted_connections, 1);
+        assert_eq!(running.active_connections, 0);
+        assert_eq!(running.bytes_from_local, 4);
+        assert_eq!(running.bytes_to_local, 4);
+        assert_eq!(running.failed_connections, 0);
+        assert_eq!(authentication_attempts.load(Ordering::SeqCst), 1);
+        let stopped = session.shutdown().await.unwrap();
+        assert!(!stopped.running);
+
+        let rejected = NativeLocalForwardRequest::new(
+            format!("127.0.0.1:{}", address.port())
+                .parse::<SshTarget>()
+                .unwrap(),
+            "fixture-user",
+            SecretBytes::new(encoded_client_key.as_bytes().to_vec()),
+            LocalForwardSpec::new("127.0.0.1:0".parse().unwrap(), "localhost", 443).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            engine
+                .start_local_forward(
+                    rejected,
+                    &HostKeyHistory::new(HostId::new()),
+                    &HostKeyPolicy::strict(),
+                )
+                .await,
+            Err(NativeSshError::HostKeyRejected(_))
+        ));
+        assert_eq!(authentication_attempts.load(Ordering::SeqCst), 1);
+
+        shutdown.shutdown("test complete".to_owned());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_forward_signs_with_agent_and_rejects_a_missing_identity_before_connecting() {
+        let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let mut request = [0_u8; 5];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"agent");
+            stream.write_all(b"relay").await.unwrap();
+        });
+        let server_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let (address, shutdown, task, authentication_attempts) =
+            start_server(server_key.clone(), Some(client_key.public_key().clone())).await;
+        let mut history = HostKeyHistory::new(HostId::new());
+        history
+            .trust_first_use(
+                HostKeyObservation::presented(
+                    HostKeyMaterial::new(
+                        HostKeyAlgorithm::new(server_key.public_key().algorithm().to_string())
+                            .unwrap(),
+                        server_key.public_key().to_bytes().unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                10,
+            )
+            .unwrap();
+        let (agent_client_stream, agent_server_stream) = tokio::io::duplex(64 * 1024);
+        let listener = futures::stream::iter([Ok::<_, std::io::Error>(agent_server_stream)]);
+        tokio::spawn(async move {
+            russh::keys::agent::server::serve(listener, ())
+                .await
+                .unwrap();
+        });
+        let mut agent = AgentClient::connect(agent_client_stream);
+        agent.add_identity(&client_key, &[]).await.unwrap();
+        let selected = list_agent_identities(&mut agent).await.unwrap()[0]
+            .external_reference()
+            .unwrap();
+        let spec = LocalForwardSpec::new(
+            "127.0.0.1:0".parse().unwrap(),
+            upstream_address.ip().to_string(),
+            upstream_address.port(),
+        )
+        .unwrap();
+        let target = format!("127.0.0.1:{}", address.port())
+            .parse::<SshTarget>()
+            .unwrap();
+        let request =
+            NativeAgentLocalForwardRequest::new(target, "fixture-user", selected, spec).unwrap();
+        let engine = NativeSshEngine::new(Duration::from_secs(5));
+        let session = engine
+            .start_agent_local_forward(request, &mut agent, &history, &HostKeyPolicy::strict())
+            .await
+            .unwrap();
+        let mut client = TcpStream::connect(session.local_address()).await.unwrap();
+        client.write_all(b"agent").await.unwrap();
+        let mut response = [0_u8; 5];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"relay");
+        drop(client);
+        upstream_task.await.unwrap();
+        session.shutdown().await.unwrap();
+        assert_eq!(authentication_attempts.load(Ordering::SeqCst), 1);
+
+        let missing_key =
+            PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let missing_reference = ExternalKeyReference::new(
+            missing_key.public_key().algorithm().to_string(),
+            missing_key.public_key().to_bytes().unwrap(),
+            None,
+        )
+        .unwrap();
+        let missing_request = NativeAgentLocalForwardRequest::new(
+            "127.0.0.1:1".parse::<SshTarget>().unwrap(),
+            "fixture-user",
+            missing_reference,
+            LocalForwardSpec::new("127.0.0.1:0".parse().unwrap(), "localhost", 443).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            engine
+                .start_agent_local_forward(
+                    missing_request,
+                    &mut agent,
+                    &HostKeyHistory::new(HostId::new()),
+                    &HostKeyPolicy::strict(),
+                )
+                .await,
+            Err(NativeSshError::AgentIdentityNotFound)
+        ));
+        assert_eq!(authentication_attempts.load(Ordering::SeqCst), 1);
+
+        shutdown.shutdown("test complete".to_owned());
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

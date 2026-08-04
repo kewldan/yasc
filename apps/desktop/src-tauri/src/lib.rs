@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     io,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{Arc, Mutex, MutexGuard},
     task::{Context, Poll},
@@ -24,21 +25,48 @@ use yasc_domain::{
 };
 use yasc_platform::{PlatformError, PlatformPaths};
 use yasc_ssh::{
-    NativeAgentSftpRequest, NativeAgentShellRequest, NativeHostKeyProbe, NativeSftpSession,
-    NativeShellIo, NativeSshEngine, NativeSshError, SftpEntry, SftpUploadResult, TerminalSize,
-    connect_agent, external_key_fingerprint, list_agent_identities as query_agent_identities,
+    LocalForwardSpec, NativeAgentLocalForwardRequest, NativeAgentSftpRequest,
+    NativeAgentShellRequest, NativeHostKeyProbe, NativeLocalForwardSession,
+    NativeLocalForwardSnapshot, NativeSftpSession, NativeShellIo, NativeSshEngine, NativeSshError,
+    SftpEntry, SftpUploadResult, TerminalSize, connect_agent, external_key_fingerprint,
+    list_agent_identities as query_agent_identities,
 };
 use yasc_storage::{PersistedCredential, SqliteStorage, StorageError};
 
 struct DesktopState {
     database: Mutex<SqliteStorage>,
     sessions: Arc<AsyncMutex<HashMap<String, SessionControl>>>,
+    local_forwards: Arc<AsyncMutex<HashMap<String, LocalForwardControl>>>,
 }
 
 #[derive(Clone)]
 struct SessionControl {
     input: Arc<AsyncMutex<DuplexStream>>,
     size: watch::Sender<TerminalSize>,
+}
+
+struct LocalForwardControl {
+    host_id: HostId,
+    credential_id: CredentialId,
+    session: NativeLocalForwardSession,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalForwardSummary {
+    id: String,
+    host_id: HostId,
+    credential_id: CredentialId,
+    local_address: String,
+    remote_host: String,
+    remote_port: u16,
+    host_key_status: String,
+    accepted_connections: u64,
+    active_connections: usize,
+    bytes_from_local: u64,
+    bytes_to_local: u64,
+    failed_connections: u64,
+    running: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -168,6 +196,8 @@ enum DesktopError {
     HostKeyNotTrustable(String),
     #[error("session {0} was not found")]
     SessionNotFound(String),
+    #[error("local forward {0} was not found")]
+    LocalForwardNotFound(String),
     #[error("terminal input chunk exceeds 65536 bytes")]
     InputTooLarge,
     #[error("SFTP upload chunk exceeds 10485760 bytes")]
@@ -272,6 +302,29 @@ fn summarize_probe(probe: &NativeHostKeyProbe) -> HostKeyProbeSummary {
         decision: decision.to_owned(),
         accepted: probe.decision.is_accepted(),
         can_trust_first_use: probe.decision == HostKeyDecision::ConfirmFirstUse,
+    }
+}
+
+fn summarize_local_forward(
+    id: &str,
+    host_id: HostId,
+    credential_id: CredentialId,
+    snapshot: NativeLocalForwardSnapshot,
+) -> LocalForwardSummary {
+    LocalForwardSummary {
+        id: id.to_owned(),
+        host_id,
+        credential_id,
+        local_address: snapshot.local_address.to_string(),
+        remote_host: snapshot.remote_host,
+        remote_port: snapshot.remote_port,
+        host_key_status: format!("{:?}", snapshot.host_key_decision),
+        accepted_connections: snapshot.accepted_connections,
+        active_connections: snapshot.active_connections,
+        bytes_from_local: snapshot.bytes_from_local,
+        bytes_to_local: snapshot.bytes_to_local,
+        failed_connections: snapshot.failed_connections,
+        running: snapshot.running,
     }
 }
 
@@ -537,6 +590,87 @@ async fn upload_sftp_file(
 }
 
 #[tauri::command]
+async fn list_local_forwards(
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Vec<LocalForwardSummary>, DesktopError> {
+    let forwards = state.local_forwards.lock().await;
+    let mut summaries = forwards
+        .iter()
+        .map(|(id, control)| {
+            summarize_local_forward(
+                id,
+                control.host_id,
+                control.credential_id,
+                control.session.snapshot(),
+            )
+        })
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(summaries)
+}
+
+#[tauri::command]
+async fn start_local_forward(
+    state: tauri::State<'_, DesktopState>,
+    host_id: HostId,
+    credential_id: CredentialId,
+    local_port: u16,
+    remote_host: String,
+    remote_port: u16,
+) -> Result<LocalForwardSummary, DesktopError> {
+    let (host, history, provider, external_key) = {
+        let storage = database(&state)?;
+        resolve_agent_session(&storage, host_id, credential_id)?
+    };
+    let username = host
+        .target
+        .username()
+        .ok_or(DesktopError::UsernameRequired)?
+        .to_owned();
+    let spec = LocalForwardSpec::new(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port),
+        remote_host,
+        remote_port,
+    )?;
+    let request = NativeAgentLocalForwardRequest::new(host.target, username, external_key, spec)?;
+    let mut agent = connect_agent(provider).await?;
+    let session = NativeSshEngine::default()
+        .start_agent_local_forward(request, &mut agent, &history, &HostKeyPolicy::strict())
+        .await?;
+    let id = Uuid::new_v4().to_string();
+    let summary = summarize_local_forward(&id, host_id, credential_id, session.snapshot());
+    state.local_forwards.lock().await.insert(
+        id,
+        LocalForwardControl {
+            host_id,
+            credential_id,
+            session,
+        },
+    );
+    Ok(summary)
+}
+
+#[tauri::command]
+async fn stop_local_forward(
+    state: tauri::State<'_, DesktopState>,
+    forward_id: String,
+) -> Result<LocalForwardSummary, DesktopError> {
+    let control = state
+        .local_forwards
+        .lock()
+        .await
+        .remove(&forward_id)
+        .ok_or_else(|| DesktopError::LocalForwardNotFound(forward_id.clone()))?;
+    let snapshot = control.session.shutdown().await?;
+    Ok(summarize_local_forward(
+        &forward_id,
+        control.host_id,
+        control.credential_id,
+        snapshot,
+    ))
+}
+
+#[tauri::command]
 async fn start_agent_session(
     state: tauri::State<'_, DesktopState>,
     host_id: HostId,
@@ -673,6 +807,7 @@ pub fn run() {
             app.manage(DesktopState {
                 database: Mutex::new(storage),
                 sessions: Arc::new(AsyncMutex::new(HashMap::new())),
+                local_forwards: Arc::new(AsyncMutex::new(HashMap::new())),
             });
             Ok(())
         })
@@ -691,6 +826,9 @@ pub fn run() {
             list_sftp_directory,
             read_sftp_file,
             upload_sftp_file,
+            list_local_forwards,
+            start_local_forward,
+            stop_local_forward,
         ])
         .run(tauri::generate_context!())
         .expect("YASC desktop runtime failed");

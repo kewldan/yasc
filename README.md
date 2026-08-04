@@ -26,8 +26,9 @@ tests/                 Cross-crate and compatibility fixtures
 ```
 
 The macOS Desktop MVP now provides local inventory, external-agent credential registration,
-explicit first-use host-key trust, a native interactive SSH terminal, and a bounded native SFTP
-browser with create-only upload. Product documentation
+explicit first-use host-key trust, a native interactive SSH terminal, a bounded native SFTP
+browser with create-only upload, and a Tailwind CSS 4 tunnel dashboard backed by native
+loopback-only local forwarding. Product documentation
 lives in the separate
 [YASC documentation repository](https://github.com/kewldan/yasc-docs).
 
@@ -145,6 +146,8 @@ cargo run -p yasc-cli -- --database ./yasc.db sftp download <HOST_ID> \
   /var/log/app.log ./app.log --credential <CREDENTIAL_ID> --max-bytes 104857600
 cargo run -p yasc-cli -- --database ./yasc.db sftp upload <HOST_ID> \
   ./release.tar /srv/releases/release.tar --credential <CREDENTIAL_ID> --max-bytes 104857600
+cargo run -p yasc-cli -- --database ./yasc.db tunnel local <HOST_ID> \
+  --credential <CREDENTIAL_ID> --local-port 0 database.internal 5432
 ```
 
 The native command path requires a username in the stored target, applies strict persistent
@@ -164,6 +167,12 @@ Directory results and downloads are bounded. Upload writes a unique exclusive si
 file and publishes it with SFTP v3 rename; it never deletes or truncates an existing destination.
 CLI downloads persist through a local no-clobber temporary file. Resume, checksums, conflict UX,
 remote editing, cancellation, and transfer recovery remain planned queue work.
+
+Native local forwarding binds only to IPv4 or IPv6 loopback, reuses strict host-key and host-scoped
+credential checks, opens real SSH `direct-tcpip` channels, and reports lifecycle, traffic, and
+failure counters. The CLI runs until `Ctrl-C`; the macOS Desktop can start, observe, and stop
+forwards. Remote forwarding, dynamic SOCKS, jump chains, reconnect, and compatibility qualification
+remain 0.1 work.
 
 The same core format, lint, and test gates run on Linux, macOS, and Windows in GitHub Actions. A
 separate macOS job tests both Desktop layers and builds the application bundle in parallel.
