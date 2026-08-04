@@ -2,6 +2,10 @@
 
 #![forbid(unsafe_code)]
 
+mod native;
+
+pub use native::{NativeHostKeyProbe, NativeSshEngine, NativeSshError};
+
 use std::{
     collections::BTreeMap,
     env,

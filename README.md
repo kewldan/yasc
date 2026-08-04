@@ -61,6 +61,14 @@ cargo run -p yasc-cli -- --database ./yasc.db host-key list <HOST_ID> --events
 confirmation-required keys. Explicit `trust`, `rotate`, and authenticated `accept-update`
 commands are the only paths that persist trust changes.
 
+The native handshake probe evaluates the exact server key before authentication and disconnects
+without opening a session. First use remains an explicit state change:
+
+```bash
+cargo run -p yasc-cli -- --database ./yasc.db host-key probe <HOST_ID> --ask --json
+cargo run -p yasc-cli -- --database ./yasc.db host-key probe <HOST_ID> --trust-first-use
+```
+
 The same format, lint, and test gates run on Linux, macOS, and Windows in GitHub Actions.
 
 Without `--database`, the CLI stores inventory in the operating system's application-data

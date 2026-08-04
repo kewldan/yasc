@@ -4,6 +4,7 @@ use std::{
     collections::BTreeSet,
     path::PathBuf,
     process::ExitCode,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -15,8 +16,8 @@ use yasc_domain::{
 };
 use yasc_platform::{PlatformError, PlatformPaths};
 use yasc_ssh::{
-    ConnectionPlan, HostKeyPolicy as OpenSshHostKeyPolicy, OpenSshEngine, OpenSshError,
-    OpenSshRequest, SshEngine,
+    ConnectionPlan, HostKeyPolicy as OpenSshHostKeyPolicy, NativeSshEngine, NativeSshError,
+    OpenSshEngine, OpenSshError, OpenSshRequest, SshEngine,
 };
 use yasc_storage::{SqliteStorage, StorageError};
 
@@ -114,6 +115,8 @@ enum HostCommand {
 
 #[derive(Debug, Subcommand)]
 enum HostKeyCommand {
+    /// Perform native SSH key exchange and evaluate the exact presented server key.
+    Probe(HostKeyProbeArgs),
     /// Evaluate a presented key without changing trust state.
     Check(HostKeyCheckArgs),
     /// Trust the first key for a host after explicit confirmation.
@@ -126,6 +129,24 @@ enum HostKeyCommand {
     Revoke(HostKeyRevokeArgs),
     /// List key history or immutable trust events.
     List(HostKeyListArgs),
+}
+
+#[derive(Debug, Args)]
+struct HostKeyProbeArgs {
+    /// Inventory host identifier.
+    host_id: HostId,
+    /// Ask for confirmation when no trusted key exists.
+    #[arg(long)]
+    ask: bool,
+    /// Explicitly persist a key when the probe returns a first-use confirmation decision.
+    #[arg(long)]
+    trust_first_use: bool,
+    /// SSH handshake timeout in seconds.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=300))]
+    timeout_seconds: u64,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -254,8 +275,9 @@ struct HostIdArgs {
     json: bool,
 }
 
-fn main() -> ExitCode {
-    match run(Cli::parse()) {
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
@@ -264,7 +286,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), CliError> {
+async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Inspect(args) => {
             let request = args.openssh.request(args.target.clone());
@@ -331,17 +353,18 @@ fn run(cli: Cli) -> Result<(), CliError> {
             }
         }
         Command::Host { command } => run_host_command(cli.database, command)?,
-        Command::HostKey { command } => run_host_key_command(cli.database, command)?,
+        Command::HostKey { command } => run_host_key_command(cli.database, command).await?,
     }
     Ok(())
 }
 
-fn run_host_key_command(
+async fn run_host_key_command(
     database: Option<PathBuf>,
     command: HostKeyCommand,
 ) -> Result<(), CliError> {
     let mut storage = open_storage(database)?;
     let host_id = match &command {
+        HostKeyCommand::Probe(args) => args.host_id,
         HostKeyCommand::Check(args) => args.key.host_id,
         HostKeyCommand::Trust(args) => args.key.host_id,
         HostKeyCommand::Rotate(args) => args.key.host_id,
@@ -349,11 +372,43 @@ fn run_host_key_command(
         HostKeyCommand::Revoke(args) => args.host_id,
         HostKeyCommand::List(args) => args.host_id,
     };
-    storage
+    let host = storage
         .find_host(host_id)?
         .ok_or(CliError::HostNotFound(host_id))?;
 
     match command {
+        HostKeyCommand::Probe(args) => {
+            let mut history = storage.load_host_key_history(args.host_id)?;
+            let policy = if args.ask || args.trust_first_use {
+                HostKeyPolicy::ask_on_first_use()
+            } else {
+                HostKeyPolicy::strict()
+            };
+            let engine = NativeSshEngine::new(Duration::from_secs(args.timeout_seconds));
+            let probe = engine
+                .probe_host_key(&host.target, &history, &policy)
+                .await?;
+            if probe.decision == HostKeyDecision::ConfirmFirstUse && args.trust_first_use {
+                let event = history.trust_first_use(probe.observation, unix_now()?)?;
+                storage.save_host_key_change(&history, &event)?;
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "decision": "trusted_first_use",
+                            "event": event,
+                        }))?
+                    );
+                } else {
+                    println!("Trusted first-use host key: {}", event.fingerprint);
+                }
+            } else {
+                print_native_probe(&probe, args.json)?;
+                if !probe.decision.is_accepted() {
+                    return Err(CliError::HostKeyRejected(probe.decision));
+                }
+            }
+        }
         HostKeyCommand::Check(args) => {
             let history = storage.load_host_key_history(args.key.host_id)?;
             let mut observation = presented_host_key(args.key)?;
@@ -445,6 +500,19 @@ fn run_host_key_command(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn print_native_probe(probe: &yasc_ssh::NativeHostKeyProbe, json: bool) -> Result<(), CliError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(probe)?);
+    } else {
+        println!("Native SSH host-key probe");
+        println!("  algorithm: {}", probe.observation.material.algorithm);
+        println!("  fingerprint: {}", probe.observation.material.fingerprint);
+        println!("  decision: {:?}", probe.decision);
+        println!("  authentication: not attempted");
     }
     Ok(())
 }
@@ -582,6 +650,8 @@ enum CliError {
     Platform(#[from] PlatformError),
     #[error(transparent)]
     OpenSsh(#[from] OpenSshError),
+    #[error(transparent)]
+    NativeSsh(#[from] NativeSshError),
     #[error(transparent)]
     InvalidHost(#[from] yasc_domain::HostError),
     #[error(transparent)]
