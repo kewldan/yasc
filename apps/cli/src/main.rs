@@ -793,6 +793,7 @@ enum CliError {
         source: io::Error,
     },
     #[error("secret file permissions must deny group and other access: {0}")]
+    #[cfg(unix)]
     InsecureSecretPermissions(PathBuf),
     #[error("remote command exited with status {0}")]
     RemoteCommandExit(u32),
