@@ -69,6 +69,21 @@ cargo run -p yasc-cli -- --database ./yasc.db host-key probe <HOST_ID> --ask --j
 cargo run -p yasc-cli -- --database ./yasc.db host-key probe <HOST_ID> --trust-first-use
 ```
 
+After a host key is trusted, execute a bounded native SSH command with a key that remains in memory
+only for the request:
+
+```bash
+chmod 600 ~/.ssh/id_ed25519
+cargo run -p yasc-cli -- --database ./yasc.db exec <HOST_ID> \
+  --identity ~/.ssh/id_ed25519 'uname -a'
+```
+
+The native command path requires a username in the stored target, applies strict persistent
+host-key verification before authentication, rejects insecure key-file permissions on Unix, never
+accepts a passphrase on the command line, enforces a timeout and bounded output, and returns a
+non-successful CLI status when the remote command fails. This is a one-shot exec workflow; a native
+interactive PTY and local-vault credential selection are still in development.
+
 The same format, lint, and test gates run on Linux, macOS, and Windows in GitHub Actions.
 
 Without `--database`, the CLI stores inventory in the operating system's application-data

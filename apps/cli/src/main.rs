@@ -2,12 +2,15 @@
 
 use std::{
     collections::BTreeSet,
-    path::PathBuf,
+    fs,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
     process::ExitCode,
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose};
 use clap::{Args, Parser, Subcommand};
 use thiserror::Error;
 use yasc_domain::{
@@ -16,10 +19,11 @@ use yasc_domain::{
 };
 use yasc_platform::{PlatformError, PlatformPaths};
 use yasc_ssh::{
-    ConnectionPlan, HostKeyPolicy as OpenSshHostKeyPolicy, NativeSshEngine, NativeSshError,
-    OpenSshEngine, OpenSshError, OpenSshRequest, SshEngine,
+    ConnectionPlan, HostKeyPolicy as OpenSshHostKeyPolicy, NativeCommandRequest, NativeSshEngine,
+    NativeSshError, OpenSshEngine, OpenSshError, OpenSshRequest, SshEngine,
 };
 use yasc_storage::{SqliteStorage, StorageError};
+use yasc_vault::SecretBytes;
 
 #[derive(Debug, Parser)]
 #[command(name = "yasc", version, about = "Yes Another SSH Client")]
@@ -37,6 +41,8 @@ enum Command {
     Inspect(InspectArgs),
     /// Open an interactive direct SSH session using the controlled OpenSSH adapter.
     Connect(ConnectArgs),
+    /// Execute one command through the native SSH engine.
+    Exec(NativeExecArgs),
     /// Manage the local host inventory.
     Host {
         #[command(subcommand)]
@@ -47,6 +53,29 @@ enum Command {
         #[command(subcommand)]
         command: HostKeyCommand,
     },
+}
+
+#[derive(Debug, Args)]
+struct NativeExecArgs {
+    /// Inventory host identifier. The host target must include a username.
+    host_id: HostId,
+    /// Private key in an OpenSSH, PKCS#8, PEM, or supported PuTTY text format.
+    #[arg(long, value_name = "PATH")]
+    identity: PathBuf,
+    /// File containing the private-key passphrase. Trailing CR/LF bytes are removed.
+    #[arg(long, value_name = "PATH")]
+    passphrase_file: Option<PathBuf>,
+    /// Remote command string passed to the SSH exec request.
+    command: String,
+    /// End-to-end command timeout in seconds.
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=86400))]
+    timeout_seconds: u64,
+    /// Combined stdout and stderr capture limit.
+    #[arg(long, default_value_t = 1_048_576)]
+    max_output_bytes: usize,
+    /// Print machine-readable JSON with base64-encoded output.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -352,10 +381,95 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 return Err(CliError::SshExit(status.code()));
             }
         }
+        Command::Exec(args) => run_native_exec(cli.database, args).await?,
         Command::Host { command } => run_host_command(cli.database, command)?,
         Command::HostKey { command } => run_host_key_command(cli.database, command).await?,
     }
     Ok(())
+}
+
+async fn run_native_exec(database: Option<PathBuf>, args: NativeExecArgs) -> Result<(), CliError> {
+    let storage = open_storage(database)?;
+    let host = storage
+        .find_host(args.host_id)?
+        .ok_or(CliError::HostNotFound(args.host_id))?;
+    let username = host
+        .target
+        .username()
+        .ok_or(CliError::NativeUsernameRequired)?
+        .to_owned();
+    let private_key = read_secret_file(&args.identity, false)?;
+    let mut request = NativeCommandRequest::new(
+        host.target,
+        username,
+        private_key,
+        args.command.into_bytes(),
+    )?
+    .with_timeout(Duration::from_secs(args.timeout_seconds))?
+    .with_max_output_bytes(args.max_output_bytes)?;
+    if let Some(path) = args.passphrase_file {
+        request = request.with_passphrase(read_secret_file(&path, true)?);
+    }
+    let history = storage.load_host_key_history(args.host_id)?;
+    let engine = NativeSshEngine::default();
+    let output = engine
+        .execute_command(request, &history, &HostKeyPolicy::strict())
+        .await?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "exit_status": output.exit_status(),
+                "stdout_base64": general_purpose::STANDARD.encode(output.stdout()),
+                "stderr_base64": general_purpose::STANDARD.encode(output.stderr()),
+                "host_key_decision": output.host_key_decision(),
+            }))?
+        );
+    } else {
+        io::stdout().write_all(output.stdout())?;
+        io::stdout().flush()?;
+        io::stderr().write_all(output.stderr())?;
+        io::stderr().flush()?;
+    }
+    if output.exit_status() != 0 {
+        return Err(CliError::RemoteCommandExit(output.exit_status()));
+    }
+    Ok(())
+}
+
+fn read_secret_file(path: &Path, trim_line_endings: bool) -> Result<SecretBytes, CliError> {
+    let mut file = fs::File::open(path).map_err(|source| CliError::ReadSecret {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = file
+            .metadata()
+            .map_err(|source| CliError::ReadSecret {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(CliError::InsecureSecretPermissions(path.to_path_buf()));
+        }
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| CliError::ReadSecret {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if trim_line_endings {
+        while matches!(bytes.last(), Some(b'\r' | b'\n')) {
+            bytes.pop();
+        }
+    }
+    Ok(SecretBytes::new(bytes))
 }
 
 async fn run_host_key_command(
@@ -643,6 +757,8 @@ fn print_host(host: &Host, json: bool) -> Result<(), CliError> {
 #[derive(Debug, Error)]
 enum CliError {
     #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Storage(#[from] StorageError),
@@ -668,4 +784,53 @@ enum CliError {
     ClockBeforeEpoch,
     #[error("system clock is outside the supported range")]
     ClockOutOfRange,
+    #[error("native SSH requires a username in the inventory target")]
+    NativeUsernameRequired,
+    #[error("failed to read secret file {path}: {source}")]
+    ReadSecret {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("secret file permissions must deny group and other access: {0}")]
+    InsecureSecretPermissions(PathBuf),
+    #[error("remote command exited with status {0}")]
+    RemoteCommandExit(u32),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passphrase_file_trims_only_trailing_line_endings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("passphrase");
+        fs::write(&path, b"  keep spaces  \r\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let secret = read_secret_file(&path, true).unwrap();
+
+        assert_eq!(secret.expose_secret(), b"  keep spaces  ");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_key_file_rejects_group_or_other_access() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity");
+        fs::write(&path, b"not a real key").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        assert!(matches!(
+            read_secret_file(&path, false),
+            Err(CliError::InsecureSecretPermissions(found)) if found == path
+        ));
+    }
 }

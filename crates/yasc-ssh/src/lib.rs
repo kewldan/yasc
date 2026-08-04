@@ -4,7 +4,9 @@
 
 mod native;
 
-pub use native::{NativeHostKeyProbe, NativeSshEngine, NativeSshError};
+pub use native::{
+    NativeCommandOutput, NativeCommandRequest, NativeHostKeyProbe, NativeSshEngine, NativeSshError,
+};
 
 use std::{
     collections::BTreeMap,

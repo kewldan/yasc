@@ -2318,15 +2318,18 @@ dependencies = [
 name = "yasc-cli"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "yasc-domain",
  "yasc-platform",
  "yasc-ssh",
  "yasc-storage",
+ "yasc-vault",
 ]
 
 [[package]]
@@ -2358,6 +2361,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "yasc-domain",
+ "yasc-vault",
 ]
 
 [[package]]
