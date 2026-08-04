@@ -115,7 +115,6 @@ impl OpenSshRequest {
             arguments.push(OsString::from("-l"));
             arguments.push(OsString::from(username));
         }
-        arguments.push(OsString::from("--"));
         arguments.push(OsString::from(self.target.host()));
         arguments
     }
@@ -362,14 +361,13 @@ mod tests {
     }
 
     #[test]
-    fn arguments_are_structured_and_end_with_separator_and_host() {
+    fn arguments_are_structured_and_end_with_host() {
         let mut request = OpenSshRequest::new("admin@example.com:2222".parse().unwrap());
         request.config_file = Some(PathBuf::from("/tmp/ssh config"));
         request.identity_file = Some(PathBuf::from("/tmp/key;touch-pwned"));
         let arguments = request.arguments(false);
 
         assert_eq!(arguments.last().unwrap(), "example.com");
-        assert_eq!(arguments[arguments.len() - 2], "--");
         assert!(arguments.contains(&OsString::from("/tmp/key;touch-pwned")));
         assert!(!arguments.iter().any(|argument| argument == "sh"));
     }
@@ -408,7 +406,7 @@ mod tests {
         let diagnostic = safe_diagnostic(stderr.as_bytes());
 
         assert!(!diagnostic.contains("token=secret"));
-        assert!(!home.is_empty() || !diagnostic.contains(&home));
+        assert!(home.is_empty() || !diagnostic.contains(&home));
     }
 
     #[test]

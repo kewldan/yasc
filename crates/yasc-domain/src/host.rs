@@ -112,6 +112,9 @@ impl FromStr for SshTarget {
         };
 
         let (host, port, port_explicit) = parse_host_and_port(host_and_port)?;
+        if host.starts_with('-') || host.chars().any(char::is_control) {
+            return Err(TargetParseError::InvalidHost);
+        }
         Ok(Self {
             host: host.to_owned(),
             port,
@@ -182,6 +185,8 @@ pub enum TargetParseError {
     InvalidUsername,
     #[error("SSH target is missing a host")]
     MissingHost,
+    #[error("SSH host is invalid")]
+    InvalidHost,
     #[error("bracketed IPv6 address is missing a closing bracket")]
     UnclosedIpv6Address,
     #[error("unexpected text after bracketed IPv6 address")]
@@ -283,5 +288,12 @@ mod tests {
         let error = "example.com:0".parse::<SshTarget>().unwrap_err();
 
         assert_eq!(error, TargetParseError::InvalidPort);
+    }
+
+    #[test]
+    fn rejects_option_like_host() {
+        let error = "-oProxyCommand=malicious".parse::<SshTarget>().unwrap_err();
+
+        assert_eq!(error, TargetParseError::InvalidHost);
     }
 }
