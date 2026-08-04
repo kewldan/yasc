@@ -5,7 +5,8 @@
 mod native;
 
 pub use native::{
-    NativeCommandOutput, NativeCommandRequest, NativeHostKeyProbe, NativeSshEngine, NativeSshError,
+    NativeCommandOutput, NativeCommandRequest, NativeHostKeyProbe, NativeShellIo,
+    NativeShellOutput, NativeShellRequest, NativeSshEngine, NativeSshError, TerminalSize,
     validate_private_key,
 };
 

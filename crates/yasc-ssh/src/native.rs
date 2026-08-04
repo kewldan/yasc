@@ -9,7 +9,11 @@ use russh::{
 };
 use serde::Serialize;
 use thiserror::Error;
-use tokio::time::timeout;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::watch,
+    time::timeout,
+};
 use yasc_domain::{
     HostKeyAlgorithm, HostKeyDecision, HostKeyError, HostKeyHistory, HostKeyMaterial,
     HostKeyObservation, HostKeyPolicy, SshTarget,
@@ -69,9 +73,7 @@ impl NativeCommandRequest {
     ) -> Result<Self, NativeSshError> {
         let username = username.into();
         let command = command.into();
-        if username.trim().is_empty() || username.chars().any(char::is_control) {
-            return Err(NativeSshError::InvalidUsername);
-        }
+        validate_username(&username)?;
         if private_key.is_empty() {
             return Err(NativeSshError::EmptyPrivateKey);
         }
@@ -112,6 +114,13 @@ impl NativeCommandRequest {
     }
 }
 
+fn validate_username(username: &str) -> Result<(), NativeSshError> {
+    if username.trim().is_empty() || username.chars().any(char::is_control) {
+        return Err(NativeSshError::InvalidUsername);
+    }
+    Ok(())
+}
+
 impl std::fmt::Debug for NativeCommandRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -135,6 +144,149 @@ pub struct NativeCommandOutput {
     stderr: Vec<u8>,
     exit_status: u32,
     host_key_decision: HostKeyDecision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TerminalSize {
+    pub columns: u32,
+    pub rows: u32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+}
+
+impl TerminalSize {
+    pub fn new(columns: u32, rows: u32) -> Result<Self, NativeSshError> {
+        if columns == 0 || rows == 0 {
+            return Err(NativeSshError::InvalidTerminalSize);
+        }
+        Ok(Self {
+            columns,
+            rows,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+    }
+
+    #[must_use]
+    pub const fn with_pixels(mut self, pixel_width: u32, pixel_height: u32) -> Self {
+        self.pixel_width = pixel_width;
+        self.pixel_height = pixel_height;
+        self
+    }
+}
+
+pub struct NativeShellRequest {
+    target: SshTarget,
+    username: String,
+    private_key: SecretBytes,
+    private_key_passphrase: Option<SecretBytes>,
+    terminal_type: String,
+    initial_size: TerminalSize,
+}
+
+pub struct NativeShellIo<R, O, E> {
+    input: R,
+    output: O,
+    error_output: E,
+    size_changes: watch::Receiver<TerminalSize>,
+}
+
+impl<R, O, E> NativeShellIo<R, O, E> {
+    #[must_use]
+    pub const fn new(
+        input: R,
+        output: O,
+        error_output: E,
+        size_changes: watch::Receiver<TerminalSize>,
+    ) -> Self {
+        Self {
+            input,
+            output,
+            error_output,
+            size_changes,
+        }
+    }
+}
+
+impl NativeShellRequest {
+    pub fn new(
+        target: SshTarget,
+        username: impl Into<String>,
+        private_key: SecretBytes,
+        initial_size: TerminalSize,
+    ) -> Result<Self, NativeSshError> {
+        let username = username.into();
+        validate_username(&username)?;
+        if private_key.is_empty() {
+            return Err(NativeSshError::EmptyPrivateKey);
+        }
+        Ok(Self {
+            target,
+            username,
+            private_key,
+            private_key_passphrase: None,
+            terminal_type: "xterm-256color".to_owned(),
+            initial_size,
+        })
+    }
+
+    #[must_use]
+    pub fn with_passphrase(mut self, passphrase: SecretBytes) -> Self {
+        self.private_key_passphrase = Some(passphrase);
+        self
+    }
+
+    pub fn with_terminal_type(
+        mut self,
+        terminal_type: impl Into<String>,
+    ) -> Result<Self, NativeSshError> {
+        let terminal_type = terminal_type.into();
+        if terminal_type.is_empty()
+            || terminal_type.len() > 64
+            || !terminal_type
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(NativeSshError::InvalidTerminalType);
+        }
+        self.terminal_type = terminal_type;
+        Ok(self)
+    }
+}
+
+impl std::fmt::Debug for NativeShellRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeShellRequest")
+            .field("target", &self.target)
+            .field("username", &self.username)
+            .field("private_key", &"[REDACTED]")
+            .field(
+                "private_key_passphrase",
+                &self.private_key_passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("terminal_type", &self.terminal_type)
+            .field("initial_size", &self.initial_size)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NativeShellOutput {
+    exit_status: u32,
+    host_key_decision: HostKeyDecision,
+}
+
+impl NativeShellOutput {
+    #[must_use]
+    pub const fn exit_status(&self) -> u32 {
+        self.exit_status
+    }
+
+    #[must_use]
+    pub const fn host_key_decision(&self) -> &HostKeyDecision {
+        &self.host_key_decision
+    }
 }
 
 impl NativeCommandOutput {
@@ -339,6 +491,187 @@ impl NativeSshEngine {
             host_key_decision: probe.decision,
         })
     }
+
+    /// Opens an authenticated native SSH session, requests a PTY and shell, then streams terminal
+    /// bytes without buffering terminal contents in the engine.
+    pub async fn run_shell<R, O, E>(
+        &self,
+        request: NativeShellRequest,
+        history: &HostKeyHistory,
+        policy: &HostKeyPolicy,
+        io: NativeShellIo<R, O, E>,
+    ) -> Result<NativeShellOutput, NativeSshError>
+    where
+        R: AsyncRead + Unpin,
+        O: AsyncWrite + Unpin,
+        E: AsyncWrite + Unpin,
+    {
+        let NativeShellIo {
+            mut input,
+            mut output,
+            mut error_output,
+            mut size_changes,
+        } = io;
+        let private_key = decode_private_key(
+            &request.private_key,
+            request.private_key_passphrase.as_ref(),
+        )?;
+        let captured = Arc::new(Mutex::new(None));
+        let handler = NativeHostKeyHandler {
+            history: history.clone(),
+            policy: policy.clone(),
+            captured: Arc::clone(&captured),
+        };
+        let config = Arc::new(client::Config::default());
+        let address = (request.target.host().to_owned(), request.target.port());
+        let connect_result = timeout(
+            self.handshake_timeout,
+            client::connect(config, address, handler),
+        )
+        .await
+        .map_err(|_| NativeSshError::HandshakeTimeout)?;
+        let (mut handle, probe) = match connect_result {
+            Ok(handle) => (handle, take_probe(&captured)?),
+            Err(error) => match take_probe(&captured) {
+                Ok(probe) if !probe.decision.is_accepted() => {
+                    return Err(NativeSshError::HostKeyRejected(probe.decision));
+                }
+                Ok(_) | Err(NativeSshError::MissingHostKey) => return Err(error),
+                Err(other) => return Err(other),
+            },
+        };
+        if !probe.decision.is_accepted() {
+            return Err(NativeSshError::HostKeyRejected(probe.decision));
+        }
+
+        let rsa_hash = handle.best_supported_rsa_hash().await?.flatten();
+        let authentication = handle
+            .authenticate_publickey(
+                request.username,
+                PrivateKeyWithHashAlg::new(Arc::new(private_key), rsa_hash),
+            )
+            .await?;
+        if !authentication.success() {
+            return Err(NativeSshError::AuthenticationRejected);
+        }
+
+        let mut channel = handle.channel_open_session().await?;
+        let size = request.initial_size;
+        channel
+            .request_pty(
+                true,
+                &request.terminal_type,
+                size.columns,
+                size.rows,
+                size.pixel_width,
+                size.pixel_height,
+                &[],
+            )
+            .await?;
+        wait_for_request_success(&mut channel, NativeSshError::PtyRequestRejected).await?;
+        channel.request_shell(true).await?;
+        wait_for_request_success(&mut channel, NativeSshError::ShellRequestRejected).await?;
+
+        let (mut reader, writer) = channel.split();
+        let mut input_buffer = vec![0_u8; 16 * 1024];
+        let mut input_closed = false;
+        let mut size_stream_open = true;
+        let mut last_size = size;
+        let mut exit_status = None;
+        let mut exit_signal = None;
+        loop {
+            tokio::select! {
+                input_result = input.read(&mut input_buffer), if !input_closed => {
+                    match input_result? {
+                        0 => {
+                            input_closed = true;
+                            writer.eof().await?;
+                        }
+                        count => writer.data_bytes(input_buffer[..count].to_vec()).await?,
+                    }
+                }
+                changed = size_changes.changed(), if size_stream_open => {
+                    if changed.is_err() {
+                        size_stream_open = false;
+                    } else {
+                        let next = *size_changes.borrow_and_update();
+                        if next != last_size {
+                            writer.window_change(
+                                next.columns,
+                                next.rows,
+                                next.pixel_width,
+                                next.pixel_height,
+                            ).await?;
+                            last_size = next;
+                        }
+                    }
+                }
+                message = reader.wait() => {
+                    let Some(message) = message else { break; };
+                    match message {
+                        ChannelMsg::Data { data } => {
+                            output.write_all(&data).await?;
+                            output.flush().await?;
+                        }
+                        ChannelMsg::ExtendedData { data, ext: 1 } => {
+                            error_output.write_all(&data).await?;
+                            error_output.flush().await?;
+                        }
+                        ChannelMsg::ExtendedData { ext, .. } => {
+                            return Err(NativeSshError::UnsupportedExtendedData(ext));
+                        }
+                        ChannelMsg::ExitStatus { exit_status: status } => {
+                            exit_status = Some(status);
+                            if !input_closed {
+                                input_closed = true;
+                                writer.eof().await?;
+                            }
+                        }
+                        ChannelMsg::ExitSignal { signal_name, .. } => {
+                            exit_signal = Some(format!("{signal_name:?}"));
+                            if !input_closed {
+                                input_closed = true;
+                                writer.eof().await?;
+                            }
+                        }
+                        ChannelMsg::Close => break,
+                        ChannelMsg::Failure => return Err(NativeSshError::ShellRequestRejected),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        output.flush().await?;
+        error_output.flush().await?;
+        let _ = handle
+            .disconnect(
+                Disconnect::ByApplication,
+                "interactive shell complete",
+                "en",
+            )
+            .await;
+        if let Some(signal) = exit_signal {
+            return Err(NativeSshError::RemoteCommandSignaled(signal));
+        }
+        let exit_status = exit_status.ok_or(NativeSshError::MissingExitStatus)?;
+        Ok(NativeShellOutput {
+            exit_status,
+            host_key_decision: probe.decision,
+        })
+    }
+}
+
+async fn wait_for_request_success(
+    channel: &mut russh::Channel<client::Msg>,
+    rejected: NativeSshError,
+) -> Result<(), NativeSshError> {
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Success) => return Ok(()),
+            Some(ChannelMsg::Failure | ChannelMsg::Close) | None => return Err(rejected),
+            Some(_) => {}
+        }
+    }
 }
 
 fn append_bounded(
@@ -404,6 +737,8 @@ fn take_probe(
 
 #[derive(Debug, Error)]
 pub enum NativeSshError {
+    #[error("local terminal I/O failed: {0}")]
+    LocalIo(#[from] std::io::Error),
     #[error("native SSH transport failed: {0}")]
     Transport(#[from] russh::Error),
     #[error("presented SSH host key could not be encoded: {0}")]
@@ -430,6 +765,10 @@ pub enum NativeSshError {
     InvalidCommandTimeout,
     #[error("command output limit must be greater than zero")]
     InvalidOutputLimit,
+    #[error("terminal dimensions must be greater than zero")]
+    InvalidTerminalSize,
+    #[error("terminal type must contain 1-64 safe ASCII characters")]
+    InvalidTerminalType,
     #[error("SSH private key must use a supported UTF-8 text format")]
     PrivateKeyNotUtf8,
     #[error("SSH private-key passphrase must be UTF-8")]
@@ -440,6 +779,12 @@ pub enum NativeSshError {
     AuthenticationRejected,
     #[error("remote command request was rejected")]
     CommandRequestRejected,
+    #[error("remote server rejected the PTY request")]
+    PtyRequestRejected,
+    #[error("remote server rejected the interactive shell request")]
+    ShellRequestRejected,
+    #[error("remote shell returned unsupported extended data type {0}")]
+    UnsupportedExtendedData(u32),
     #[error("remote command exceeded its timeout")]
     CommandTimeout,
     #[error("remote command output exceeded the {limit}-byte limit")]
@@ -472,6 +817,28 @@ mod tests {
     struct TestServer {
         authorized_key: Option<ssh_key::PublicKey>,
         authentication_attempts: Arc<AtomicUsize>,
+        shell: Option<Arc<Mutex<ShellFixture>>>,
+    }
+
+    #[derive(Debug)]
+    struct ShellFixture {
+        accept_pty: bool,
+        pty: Option<(String, u32, u32)>,
+        window_changes: Vec<(u32, u32)>,
+        input: Vec<u8>,
+        shell_requests: usize,
+    }
+
+    impl ShellFixture {
+        fn accepting() -> Self {
+            Self {
+                accept_pty: true,
+                pty: None,
+                window_changes: Vec::new(),
+                input: Vec::new(),
+                shell_requests: 0,
+            }
+        }
     }
 
     impl server::Server for TestServer {
@@ -525,11 +892,108 @@ mod tests {
             session.close(channel)?;
             Ok(())
         }
+
+        async fn pty_request(
+            &mut self,
+            channel: ChannelId,
+            term: &str,
+            col_width: u32,
+            row_height: u32,
+            _: u32,
+            _: u32,
+            _: &[(russh::Pty, u32)],
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            let Some(shell) = &self.shell else {
+                session.channel_failure(channel)?;
+                return Ok(());
+            };
+            let mut shell = shell.lock().unwrap();
+            shell.pty = Some((term.to_owned(), col_width, row_height));
+            if shell.accept_pty {
+                session.channel_success(channel)?;
+            } else {
+                session.channel_failure(channel)?;
+            }
+            Ok(())
+        }
+
+        async fn shell_request(
+            &mut self,
+            channel: ChannelId,
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            let Some(shell) = &self.shell else {
+                session.channel_failure(channel)?;
+                return Ok(());
+            };
+            shell.lock().unwrap().shell_requests += 1;
+            session.channel_success(channel)?;
+            Ok(())
+        }
+
+        async fn window_change_request(
+            &mut self,
+            _: ChannelId,
+            col_width: u32,
+            row_height: u32,
+            _: u32,
+            _: u32,
+            _: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if let Some(shell) = &self.shell {
+                shell
+                    .lock()
+                    .unwrap()
+                    .window_changes
+                    .push((col_width, row_height));
+            }
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            _: ChannelId,
+            data: &[u8],
+            _: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if let Some(shell) = &self.shell {
+                shell.lock().unwrap().input.extend_from_slice(data);
+            }
+            Ok(())
+        }
+
+        async fn channel_eof(
+            &mut self,
+            channel: ChannelId,
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if self.shell.is_some() {
+                session.data(channel, b"shell stdout\r\n".as_slice())?;
+                session.extended_data(channel, 1, b"shell stderr\r\n".as_slice())?;
+                session.exit_status_request(channel, 0)?;
+                session.close(channel)?;
+            }
+            Ok(())
+        }
     }
 
     async fn start_server(
         key: PrivateKey,
         authorized_key: Option<ssh_key::PublicKey>,
+    ) -> (
+        SocketAddr,
+        russh::server::RunningServerHandle,
+        JoinHandle<std::io::Result<()>>,
+        Arc<AtomicUsize>,
+    ) {
+        start_server_with_shell(key, authorized_key, None).await
+    }
+
+    async fn start_server_with_shell(
+        key: PrivateKey,
+        authorized_key: Option<ssh_key::PublicKey>,
+        shell: Option<Arc<Mutex<ShellFixture>>>,
     ) -> (
         SocketAddr,
         russh::server::RunningServerHandle,
@@ -551,6 +1015,7 @@ mod tests {
             let mut server = TestServer {
                 authorized_key,
                 authentication_attempts: server_attempts,
+                shell,
             };
             let running = server.run_on_socket(config, &listener);
             assert!(handle_sender.send(running.handle()).is_ok());
@@ -558,6 +1023,35 @@ mod tests {
         });
         let shutdown = handle_receiver.await.unwrap();
         (address, shutdown, task, authentication_attempts)
+    }
+
+    #[test]
+    fn interactive_request_validates_terminal_metadata_and_redacts_key() {
+        assert!(matches!(
+            TerminalSize::new(0, 24),
+            Err(NativeSshError::InvalidTerminalSize)
+        ));
+        let request = NativeShellRequest::new(
+            "admin@example.com".parse().unwrap(),
+            "admin",
+            SecretBytes::new(b"private fixture value".to_vec()),
+            TerminalSize::new(80, 24).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            request.with_terminal_type("xterm;unsafe"),
+            Err(NativeSshError::InvalidTerminalType)
+        ));
+        let request = NativeShellRequest::new(
+            "admin@example.com".parse().unwrap(),
+            "admin",
+            SecretBytes::new(b"private fixture value".to_vec()),
+            TerminalSize::new(80, 24).unwrap(),
+        )
+        .unwrap();
+        let diagnostic = format!("{request:?}");
+        assert!(!diagnostic.contains("private fixture value"));
+        assert!(diagnostic.contains("[REDACTED]"));
     }
 
     #[tokio::test]
@@ -688,6 +1182,208 @@ mod tests {
             Err(NativeSshError::AuthenticationRejected)
         ));
         assert_eq!(authentication_attempts.load(Ordering::SeqCst), 3);
+
+        shutdown.shutdown("test complete".to_owned());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn interactive_shell_streams_pty_io_resize_and_exit_status() {
+        let server_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let encoded_client_key = client_key.to_openssh(LineEnding::LF).unwrap();
+        let shell = Arc::new(Mutex::new(ShellFixture::accepting()));
+        let (address, shutdown, task, authentication_attempts) = start_server_with_shell(
+            server_key.clone(),
+            Some(client_key.public_key().clone()),
+            Some(Arc::clone(&shell)),
+        )
+        .await;
+        let target = format!("127.0.0.1:{}", address.port())
+            .parse::<SshTarget>()
+            .unwrap();
+        let mut history = HostKeyHistory::new(HostId::new());
+        let server_material = HostKeyMaterial::new(
+            HostKeyAlgorithm::new(server_key.public_key().algorithm().to_string()).unwrap(),
+            server_key.public_key().to_bytes().unwrap(),
+        )
+        .unwrap();
+        history
+            .trust_first_use(HostKeyObservation::presented(server_material), 10)
+            .unwrap();
+        let initial_size = TerminalSize::new(80, 24).unwrap();
+        let request = NativeShellRequest::new(
+            target,
+            "fixture-user",
+            SecretBytes::new(encoded_client_key.as_bytes().to_vec()),
+            initial_size,
+        )
+        .unwrap()
+        .with_terminal_type("xterm-256color")
+        .unwrap();
+        let (mut input_writer, input_reader) = tokio::io::duplex(1024);
+        let (output_writer, mut output_reader) = tokio::io::duplex(1024);
+        let (error_writer, mut error_reader) = tokio::io::duplex(1024);
+        let (size_sender, size_receiver) = watch::channel(initial_size);
+        let input_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            input_writer.write_all(b"fixture input").await.unwrap();
+            input_writer.shutdown().await.unwrap();
+        });
+        let resize_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            size_sender
+                .send(TerminalSize::new(100, 40).unwrap())
+                .unwrap();
+        });
+
+        let result = timeout(
+            Duration::from_secs(5),
+            NativeSshEngine::new(Duration::from_secs(2)).run_shell(
+                request,
+                &history,
+                &HostKeyPolicy::strict(),
+                NativeShellIo::new(input_reader, output_writer, error_writer, size_receiver),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        input_task.await.unwrap();
+        resize_task.await.unwrap();
+        let mut stdout = Vec::new();
+        output_reader.read_to_end(&mut stdout).await.unwrap();
+        let mut stderr = Vec::new();
+        error_reader.read_to_end(&mut stderr).await.unwrap();
+
+        assert_eq!(result.exit_status(), 0);
+        assert!(matches!(
+            result.host_key_decision(),
+            HostKeyDecision::AcceptKnown { .. }
+        ));
+        assert_eq!(stdout, b"shell stdout\r\n");
+        assert_eq!(stderr, b"shell stderr\r\n");
+        assert_eq!(authentication_attempts.load(Ordering::SeqCst), 1);
+        {
+            let shell = shell.lock().unwrap();
+            assert_eq!(shell.pty, Some(("xterm-256color".to_owned(), 80, 24)));
+            assert_eq!(shell.window_changes, vec![(100, 40)]);
+            assert_eq!(shell.input, b"fixture input");
+            assert_eq!(shell.shell_requests, 1);
+        }
+
+        shutdown.shutdown("test complete".to_owned());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn interactive_shell_reports_pty_rejection() {
+        let server_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let encoded_client_key = client_key.to_openssh(LineEnding::LF).unwrap();
+        let shell = Arc::new(Mutex::new(ShellFixture {
+            accept_pty: false,
+            ..ShellFixture::accepting()
+        }));
+        let (address, shutdown, task, _) = start_server_with_shell(
+            server_key.clone(),
+            Some(client_key.public_key().clone()),
+            Some(shell),
+        )
+        .await;
+        let target = format!("127.0.0.1:{}", address.port())
+            .parse::<SshTarget>()
+            .unwrap();
+        let mut history = HostKeyHistory::new(HostId::new());
+        history
+            .trust_first_use(
+                HostKeyObservation::presented(
+                    HostKeyMaterial::new(
+                        HostKeyAlgorithm::new(server_key.public_key().algorithm().to_string())
+                            .unwrap(),
+                        server_key.public_key().to_bytes().unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                10,
+            )
+            .unwrap();
+        let size = TerminalSize::new(80, 24).unwrap();
+        let request = NativeShellRequest::new(
+            target,
+            "fixture-user",
+            SecretBytes::new(encoded_client_key.as_bytes().to_vec()),
+            size,
+        )
+        .unwrap();
+        let (_, size_receiver) = watch::channel(size);
+
+        assert!(matches!(
+            NativeSshEngine::new(Duration::from_secs(2))
+                .run_shell(
+                    request,
+                    &history,
+                    &HostKeyPolicy::strict(),
+                    NativeShellIo::new(
+                        tokio::io::empty(),
+                        tokio::io::sink(),
+                        tokio::io::sink(),
+                        size_receiver,
+                    ),
+                )
+                .await,
+            Err(NativeSshError::PtyRequestRejected)
+        ));
+
+        shutdown.shutdown("test complete".to_owned());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn interactive_shell_rejects_unknown_host_before_authentication() {
+        let server_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let encoded_client_key = client_key.to_openssh(LineEnding::LF).unwrap();
+        let shell = Arc::new(Mutex::new(ShellFixture::accepting()));
+        let (address, shutdown, task, authentication_attempts) = start_server_with_shell(
+            server_key,
+            Some(client_key.public_key().clone()),
+            Some(shell),
+        )
+        .await;
+        let target = format!("127.0.0.1:{}", address.port())
+            .parse::<SshTarget>()
+            .unwrap();
+        let history = HostKeyHistory::new(HostId::new());
+        let size = TerminalSize::new(80, 24).unwrap();
+        let request = NativeShellRequest::new(
+            target,
+            "fixture-user",
+            SecretBytes::new(encoded_client_key.as_bytes().to_vec()),
+            size,
+        )
+        .unwrap();
+        let (_, size_receiver) = watch::channel(size);
+
+        assert!(matches!(
+            NativeSshEngine::new(Duration::from_secs(2))
+                .run_shell(
+                    request,
+                    &history,
+                    &HostKeyPolicy::strict(),
+                    NativeShellIo::new(
+                        tokio::io::empty(),
+                        tokio::io::sink(),
+                        tokio::io::sink(),
+                        size_receiver,
+                    ),
+                )
+                .await,
+            Err(NativeSshError::HostKeyRejected(
+                HostKeyDecision::RejectUnknownStrict
+            ))
+        ));
+        assert_eq!(authentication_attempts.load(Ordering::SeqCst), 0);
 
         shutdown.shutdown("test complete".to_owned());
         task.await.unwrap().unwrap();

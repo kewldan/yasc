@@ -91,6 +91,8 @@ cargo run -p yasc-cli -- --database ./yasc.db credential import-key "Production 
 cargo run -p yasc-cli -- --database ./yasc.db credential list
 cargo run -p yasc-cli -- --database ./yasc.db exec <HOST_ID> \
   --credential <CREDENTIAL_ID> --vault-password-file ./vault-password 'uname -a'
+cargo run -p yasc-cli -- --database ./yasc.db shell <HOST_ID> \
+  --credential <CREDENTIAL_ID> --vault-password-file ./vault-password
 ```
 
 The native command path requires a username in the stored target, applies strict persistent
@@ -98,8 +100,11 @@ host-key verification before authentication, rejects insecure key-file permissio
 accepts a passphrase on the command line, enforces a timeout and bounded output, and returns a
 non-successful CLI status when the remote command fails. Vault imports validate the private key
 before encryption, store key passphrases as separate authenticated envelopes, and require a
-host-scoped direct-SSH grant before decryption. This is a one-shot exec workflow; native interactive
-PTY sessions and native-keystore unlock are still in development.
+host-scoped direct-SSH grant before decryption. The `exec` command is a one-shot workflow; native
+interactive `shell` sessions use a confirmed PTY request, stream terminal bytes without retaining
+terminal contents,
+propagate terminal-size changes, and restore local raw mode on every return path. Native-keystore
+unlock is still in development.
 
 The same format, lint, and test gates run on Linux, macOS, and Windows in GitHub Actions.
 

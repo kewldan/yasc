@@ -2,8 +2,8 @@
 
 use std::{
     collections::BTreeSet,
-    fs,
-    io::{self, Read, Write},
+    env, fs,
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
     time::Duration,
@@ -12,6 +12,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose};
 use clap::{Args, Parser, Subcommand};
+use crossterm::terminal;
 use thiserror::Error;
 use yasc_domain::{
     Credential, CredentialCapabilities, CredentialGrant, CredentialId, CredentialProviderKind,
@@ -21,8 +22,9 @@ use yasc_domain::{
 };
 use yasc_platform::{PlatformError, PlatformPaths};
 use yasc_ssh::{
-    ConnectionPlan, HostKeyPolicy as OpenSshHostKeyPolicy, NativeCommandRequest, NativeSshEngine,
-    NativeSshError, OpenSshEngine, OpenSshError, OpenSshRequest, SshEngine, validate_private_key,
+    ConnectionPlan, HostKeyPolicy as OpenSshHostKeyPolicy, NativeCommandRequest, NativeShellIo,
+    NativeShellRequest, NativeSshEngine, NativeSshError, OpenSshEngine, OpenSshError,
+    OpenSshRequest, SshEngine, TerminalSize, validate_private_key,
 };
 use yasc_storage::{SqliteStorage, StorageError};
 use yasc_vault::{EncryptedVault, SecretBytes, SecretKind, VaultBackend, VaultError};
@@ -45,6 +47,8 @@ enum Command {
     Connect(ConnectArgs),
     /// Execute one command through the native SSH engine.
     Exec(NativeExecArgs),
+    /// Open an interactive shell through the native SSH engine.
+    Shell(NativeShellArgs),
     /// Manage the local host inventory.
     Host {
         #[command(subcommand)]
@@ -94,6 +98,27 @@ struct NativeExecArgs {
     /// Print machine-readable JSON with base64-encoded output.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct NativeShellArgs {
+    /// Inventory host identifier. The host target must include a username.
+    host_id: HostId,
+    /// Private key in an OpenSSH, PKCS#8, PEM, or supported PuTTY text format.
+    #[arg(long, value_name = "PATH")]
+    identity: Option<PathBuf>,
+    /// Encrypted local-vault credential identifier.
+    #[arg(long, value_name = "ID")]
+    credential: Option<CredentialId>,
+    /// File containing the local vault password. Required with --credential.
+    #[arg(long, value_name = "PATH")]
+    vault_password_file: Option<PathBuf>,
+    /// File containing the private-key passphrase. Trailing CR/LF bytes are removed.
+    #[arg(long, value_name = "PATH")]
+    passphrase_file: Option<PathBuf>,
+    /// PTY terminal type. Defaults to the local TERM value or xterm-256color.
+    #[arg(long, value_name = "TERM")]
+    terminal_type: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -445,6 +470,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             }
         }
         Command::Exec(args) => run_native_exec(cli.database, args).await?,
+        Command::Shell(args) => run_native_shell(cli.database, args).await?,
         Command::Host { command } => run_host_command(cli.database, command)?,
         Command::HostKey { command } => run_host_key_command(cli.database, command).await?,
         Command::Vault { command } => run_vault_command(cli.database, command)?,
@@ -623,61 +649,14 @@ async fn run_native_exec(database: Option<PathBuf>, args: NativeExecArgs) -> Res
         .ok_or(CliError::NativeUsernameRequired)?
         .to_owned();
     let history = storage.load_host_key_history(args.host_id)?;
-    let (private_key, passphrase) = match (args.identity.as_deref(), args.credential) {
-        (Some(identity), None) => {
-            if args.vault_password_file.is_some() {
-                return Err(CliError::InvalidCredentialSelection);
-            }
-            (
-                read_secret_file(identity, false)?,
-                args.passphrase_file
-                    .as_deref()
-                    .map(|path| read_secret_file(path, true))
-                    .transpose()?,
-            )
-        }
-        (None, Some(credential_id)) => {
-            if args.passphrase_file.is_some() {
-                return Err(CliError::InvalidCredentialSelection);
-            }
-            let persisted = storage
-                .find_credential(credential_id)?
-                .ok_or(CliError::CredentialNotFound(credential_id))?;
-            let now = unix_now()?;
-            if persisted.credential.provider != CredentialProviderKind::LocalVault
-                || !persisted
-                    .credential
-                    .capabilities
-                    .allows(CredentialUsage::DirectSsh)
-                || !persisted
-                    .grants
-                    .iter()
-                    .any(|grant| grant.authorizes(args.host_id, CredentialUsage::DirectSsh, now))
-            {
-                return Err(CliError::CredentialUnauthorized {
-                    credential_id,
-                    host_id: args.host_id,
-                });
-            }
-            let password_path = args
-                .vault_password_file
-                .as_deref()
-                .ok_or(CliError::VaultPasswordRequired)?;
-            let key_ref = persisted
-                .secret(SecretKind::SshPrivateKey)
-                .ok_or(CliError::CredentialPrivateKeyMissing(credential_id))?;
-            let passphrase_ref = persisted.secret(SecretKind::Passphrase);
-            let password = read_secret_file(password_path, true)?;
-            let mut vault = EncryptedVault::open(storage)?;
-            vault.unlock(password)?;
-            let private_key = vault.read(key_ref)?;
-            let passphrase = passphrase_ref
-                .map(|reference| vault.read(reference))
-                .transpose()?;
-            (private_key, passphrase)
-        }
-        _ => return Err(CliError::InvalidCredentialSelection),
-    };
+    let (private_key, passphrase) = resolve_native_authentication(
+        storage,
+        args.host_id,
+        args.identity.as_deref(),
+        args.credential,
+        args.vault_password_file.as_deref(),
+        args.passphrase_file.as_deref(),
+    )?;
     let mut request = NativeCommandRequest::new(
         host.target,
         username,
@@ -713,6 +692,170 @@ async fn run_native_exec(database: Option<PathBuf>, args: NativeExecArgs) -> Res
         return Err(CliError::RemoteCommandExit(output.exit_status()));
     }
     Ok(())
+}
+
+async fn run_native_shell(
+    database: Option<PathBuf>,
+    args: NativeShellArgs,
+) -> Result<(), CliError> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(CliError::InteractiveTerminalRequired);
+    }
+    let storage = open_storage(database)?;
+    let host = storage
+        .find_host(args.host_id)?
+        .ok_or(CliError::HostNotFound(args.host_id))?;
+    let username = host
+        .target
+        .username()
+        .ok_or(CliError::NativeUsernameRequired)?
+        .to_owned();
+    let history = storage.load_host_key_history(args.host_id)?;
+    let (private_key, passphrase) = resolve_native_authentication(
+        storage,
+        args.host_id,
+        args.identity.as_deref(),
+        args.credential,
+        args.vault_password_file.as_deref(),
+        args.passphrase_file.as_deref(),
+    )?;
+    let (columns, rows) = terminal::size()?;
+    let initial_size = TerminalSize::new(u32::from(columns), u32::from(rows))?;
+    let terminal_type = args
+        .terminal_type
+        .or_else(|| env::var("TERM").ok())
+        .unwrap_or_else(|| "xterm-256color".to_owned());
+    let mut request = NativeShellRequest::new(host.target, username, private_key, initial_size)?
+        .with_terminal_type(terminal_type)?;
+    if let Some(passphrase) = passphrase {
+        request = request.with_passphrase(passphrase);
+    }
+
+    let raw_mode = RawModeGuard::enable()?;
+    let (size_sender, size_receiver) = tokio::sync::watch::channel(initial_size);
+    let resize_task = tokio::spawn(monitor_terminal_size(size_sender, initial_size));
+    let result = NativeSshEngine::default()
+        .run_shell(
+            request,
+            &history,
+            &HostKeyPolicy::strict(),
+            NativeShellIo::new(
+                tokio::io::stdin(),
+                tokio::io::stdout(),
+                tokio::io::stderr(),
+                size_receiver,
+            ),
+        )
+        .await;
+    resize_task.abort();
+    drop(raw_mode);
+    let output = result?;
+    if output.exit_status() != 0 {
+        return Err(CliError::RemoteCommandExit(output.exit_status()));
+    }
+    Ok(())
+}
+
+fn resolve_native_authentication(
+    storage: SqliteStorage,
+    host_id: HostId,
+    identity: Option<&Path>,
+    credential: Option<CredentialId>,
+    vault_password_file: Option<&Path>,
+    passphrase_file: Option<&Path>,
+) -> Result<(SecretBytes, Option<SecretBytes>), CliError> {
+    match (identity, credential) {
+        (Some(identity), None) => {
+            if vault_password_file.is_some() {
+                return Err(CliError::InvalidCredentialSelection);
+            }
+            Ok((
+                read_secret_file(identity, false)?,
+                passphrase_file
+                    .map(|path| read_secret_file(path, true))
+                    .transpose()?,
+            ))
+        }
+        (None, Some(credential_id)) => {
+            if passphrase_file.is_some() {
+                return Err(CliError::InvalidCredentialSelection);
+            }
+            let persisted = storage
+                .find_credential(credential_id)?
+                .ok_or(CliError::CredentialNotFound(credential_id))?;
+            let now = unix_now()?;
+            if persisted.credential.provider != CredentialProviderKind::LocalVault
+                || !persisted
+                    .credential
+                    .capabilities
+                    .allows(CredentialUsage::DirectSsh)
+                || !persisted
+                    .grants
+                    .iter()
+                    .any(|grant| grant.authorizes(host_id, CredentialUsage::DirectSsh, now))
+            {
+                return Err(CliError::CredentialUnauthorized {
+                    credential_id,
+                    host_id,
+                });
+            }
+            let password_path = vault_password_file.ok_or(CliError::VaultPasswordRequired)?;
+            let key_ref = persisted
+                .secret(SecretKind::SshPrivateKey)
+                .ok_or(CliError::CredentialPrivateKeyMissing(credential_id))?;
+            let passphrase_ref = persisted.secret(SecretKind::Passphrase);
+            let password = read_secret_file(password_path, true)?;
+            let mut vault = EncryptedVault::open(storage)?;
+            vault.unlock(password)?;
+            let private_key = vault.read(key_ref)?;
+            let passphrase = passphrase_ref
+                .map(|reference| vault.read(reference))
+                .transpose()?;
+            Ok((private_key, passphrase))
+        }
+        _ => Err(CliError::InvalidCredentialSelection),
+    }
+}
+
+async fn monitor_terminal_size(
+    sender: tokio::sync::watch::Sender<TerminalSize>,
+    mut last_size: TerminalSize,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        if sender.is_closed() {
+            return;
+        }
+        let Ok((columns, rows)) = terminal::size() else {
+            continue;
+        };
+        let Ok(next_size) = TerminalSize::new(u32::from(columns), u32::from(rows)) else {
+            continue;
+        };
+        if next_size != last_size {
+            if sender.send(next_size).is_err() {
+                return;
+            }
+            last_size = next_size;
+        }
+    }
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+    }
 }
 
 fn read_secret_file(path: &Path, trim_line_endings: bool) -> Result<SecretBytes, CliError> {
@@ -1070,6 +1213,8 @@ enum CliError {
     ClockOutOfRange,
     #[error("native SSH requires a username in the inventory target")]
     NativeUsernameRequired,
+    #[error("native interactive shell requires terminal stdin and stdout")]
+    InteractiveTerminalRequired,
     #[error("credential label cannot be empty")]
     EmptyCredentialLabel,
     #[error(

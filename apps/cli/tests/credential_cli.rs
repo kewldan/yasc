@@ -136,4 +136,21 @@ fn encrypted_credential_import_lists_metadata_and_enforces_host_grant() {
     );
     assert!(!unauthorized.status.success());
     assert!(String::from_utf8_lossy(&unauthorized.stderr).contains("does not authorize"));
+
+    let non_terminal_shell = yasc(
+        &database,
+        &[
+            "shell",
+            &allowed_host,
+            "--credential",
+            credential_id,
+            "--vault-password-file",
+            vault_password.to_str().unwrap(),
+        ],
+    );
+    assert!(!non_terminal_shell.status.success());
+    assert!(
+        String::from_utf8_lossy(&non_terminal_shell.stderr)
+            .contains("requires terminal stdin and stdout")
+    );
 }
