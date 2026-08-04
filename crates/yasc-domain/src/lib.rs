@@ -4,6 +4,7 @@
 
 mod credential;
 mod host;
+mod host_key;
 
 pub use credential::{
     Credential, CredentialCapabilities, CredentialCapabilityError, CredentialGrant,
@@ -11,3 +12,9 @@ pub use credential::{
     Synchronization,
 };
 pub use host::{Host, HostError, HostId, SshTarget, TargetParseError};
+pub use host_key::{
+    HostKeyAlgorithm, HostKeyDecision, HostKeyError, HostKeyEvent, HostKeyEventId,
+    HostKeyEventKind, HostKeyFingerprint, HostKeyHistory, HostKeyId, HostKeyMaterial,
+    HostKeyObservation, HostKeyPolicy, HostKeyPolicyMode, HostKeyRecord, HostKeyRecordState,
+    HostKeySource,
+};

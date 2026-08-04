@@ -45,6 +45,22 @@ cargo run -p yasc-cli -- --database ./yasc.db host add production admin@example.
 cargo run -p yasc-cli -- --database ./yasc.db host list
 ```
 
+Host-key trust is stored separately from inventory metadata. Every accepted first-use key,
+authenticated update, manual rotation, and revocation creates an immutable audit event:
+
+```bash
+# Use the host identifier returned by `host add` and the base64 SSH key blob.
+cargo run -p yasc-cli -- --database ./yasc.db host-key check \
+  <HOST_ID> ssh-ed25519 <KEY_BASE64> --ask --json
+cargo run -p yasc-cli -- --database ./yasc.db host-key trust \
+  <HOST_ID> ssh-ed25519 <KEY_BASE64>
+cargo run -p yasc-cli -- --database ./yasc.db host-key list <HOST_ID> --events
+```
+
+`check` never changes trust state and exits unsuccessfully for unknown, changed, revoked, or
+confirmation-required keys. Explicit `trust`, `rotate`, and authenticated `accept-update`
+commands are the only paths that persist trust changes.
+
 The same format, lint, and test gates run on Linux, macOS, and Windows in GitHub Actions.
 
 Without `--database`, the CLI stores inventory in the operating system's application-data
