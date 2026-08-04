@@ -37,7 +37,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p yasc-cli -- inspect admin@example.com:2222
 cargo run -p yasc-cli -- inspect --json 'admin@[2001:db8::10]:2222'
+cargo run -p yasc-cli -- --database ./yasc.db host add production admin@example.com \
+  --tag linux --tag production --environment production
+cargo run -p yasc-cli -- --database ./yasc.db host list
 ```
+
+Without `--database`, the CLI stores inventory in the operating system's application-data
+directory. Host records contain connection metadata only; credential plaintext belongs exclusively
+to the encrypted vault boundary.
 
 ## 🛡️ Security status
 
@@ -47,4 +54,3 @@ Never use unfinished vault or connection code with real secrets.
 ## 📄 License
 
 Licensed under the Apache License 2.0. See [`LICENSE`](LICENSE).
-

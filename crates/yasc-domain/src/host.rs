@@ -30,6 +30,14 @@ impl fmt::Display for HostId {
     }
 }
 
+impl FromStr for HostId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self)
+    }
+}
+
 /// A normalized direct SSH destination.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshTarget {
@@ -194,6 +202,27 @@ impl Host {
             target,
             tags: BTreeSet::new(),
             environment: None,
+        })
+    }
+
+    pub fn restore(
+        id: HostId,
+        label: impl Into<String>,
+        target: SshTarget,
+        tags: BTreeSet<String>,
+        environment: Option<String>,
+    ) -> Result<Self, HostError> {
+        let label = label.into();
+        if label.trim().is_empty() {
+            return Err(HostError::EmptyLabel);
+        }
+
+        Ok(Self {
+            id,
+            label,
+            target,
+            tags,
+            environment,
         })
     }
 }
