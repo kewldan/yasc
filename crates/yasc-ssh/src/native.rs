@@ -11,6 +11,10 @@ use russh::{
         ssh_key,
     },
 };
+use russh_sftp::{
+    client::{RawSftpSession, SftpSession, error::Error as SftpError},
+    protocol::{FileType, OpenFlags, StatusCode},
+};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::{
@@ -18,6 +22,7 @@ use tokio::{
     sync::watch,
     time::timeout,
 };
+use uuid::Uuid;
 use yasc_domain::{
     CredentialProviderKind, ExternalKeyReference, HostKeyAlgorithm, HostKeyDecision, HostKeyError,
     HostKeyHistory, HostKeyMaterial, HostKeyObservation, HostKeyPolicy, SshTarget,
@@ -156,6 +161,355 @@ pub struct NativeAgentCommandRequest {
     command: Vec<u8>,
     timeout: Duration,
     max_output_bytes: usize,
+}
+
+pub struct NativeSftpRequest {
+    target: SshTarget,
+    username: String,
+    private_key: SecretBytes,
+    private_key_passphrase: Option<SecretBytes>,
+}
+
+pub struct NativeAgentSftpRequest {
+    target: SshTarget,
+    username: String,
+    external_key: ExternalKeyReference,
+}
+
+impl NativeSftpRequest {
+    pub fn new(
+        target: SshTarget,
+        username: impl Into<String>,
+        private_key: SecretBytes,
+    ) -> Result<Self, NativeSshError> {
+        let username = username.into();
+        validate_username(&username)?;
+        if private_key.is_empty() {
+            return Err(NativeSshError::EmptyPrivateKey);
+        }
+        Ok(Self {
+            target,
+            username,
+            private_key,
+            private_key_passphrase: None,
+        })
+    }
+
+    #[must_use]
+    pub fn with_passphrase(mut self, passphrase: SecretBytes) -> Self {
+        self.private_key_passphrase = Some(passphrase);
+        self
+    }
+}
+
+impl NativeAgentSftpRequest {
+    pub fn new(
+        target: SshTarget,
+        username: impl Into<String>,
+        external_key: ExternalKeyReference,
+    ) -> Result<Self, NativeSshError> {
+        let username = username.into();
+        validate_username(&username)?;
+        let public_key = ssh_key::PublicKey::from_bytes(&external_key.public_key_blob)?;
+        if public_key.algorithm().to_string() != external_key.algorithm {
+            return Err(NativeSshError::AgentIdentityNotFound);
+        }
+        Ok(Self {
+            target,
+            username,
+            external_key,
+        })
+    }
+}
+
+impl std::fmt::Debug for NativeSftpRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeSftpRequest")
+            .field("target", &self.target)
+            .field("username", &self.username)
+            .field("private_key", &"[REDACTED]")
+            .field(
+                "private_key_passphrase",
+                &self.private_key_passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for NativeAgentSftpRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeAgentSftpRequest")
+            .field("target", &self.target)
+            .field("username", &self.username)
+            .field("external_key", &self.external_key)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SftpEntryKind {
+    Directory,
+    File,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: SftpEntryKind,
+    pub size: Option<u64>,
+    pub modified_unix_seconds: Option<u32>,
+    pub permissions: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpUploadResult {
+    pub remote_path: String,
+    pub bytes_written: usize,
+}
+
+pub struct NativeSftpSession {
+    handle: client::Handle<NativeHostKeyHandler>,
+    sftp: SftpSession,
+    host_key_decision: HostKeyDecision,
+}
+
+impl std::fmt::Debug for NativeSftpSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeSftpSession")
+            .field("host_key_decision", &self.host_key_decision)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeSftpSession {
+    #[must_use]
+    pub const fn host_key_decision(&self) -> &HostKeyDecision {
+        &self.host_key_decision
+    }
+
+    pub async fn list_directory(
+        &self,
+        remote_path: &str,
+        max_entries: usize,
+    ) -> Result<Vec<SftpEntry>, NativeSshError> {
+        validate_remote_path(remote_path, true)?;
+        if max_entries == 0 {
+            return Err(NativeSshError::InvalidSftpEntryLimit);
+        }
+        let mut channel = self.handle.channel_open_session().await?;
+        channel.request_subsystem(true, "sftp").await?;
+        wait_for_request_success(&mut channel, NativeSshError::SftpSubsystemRejected).await?;
+        let raw = RawSftpSession::new(channel.into_stream());
+        raw.init().await?;
+        let directory = raw.opendir(remote_path).await?;
+        let mut entries = Vec::new();
+        loop {
+            let batch = match raw.readdir(&directory.handle).await {
+                Ok(batch) => batch,
+                Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => break,
+                Err(error) => return Err(error.into()),
+            };
+            for entry in batch.files {
+                if matches!(entry.filename.as_str(), "." | "..") {
+                    continue;
+                }
+                validate_remote_entry_name(&entry.filename)?;
+                if entries.len() == max_entries {
+                    let _ = raw.close(&directory.handle).await;
+                    let _ = raw.close_session();
+                    return Err(NativeSshError::SftpEntryLimitExceeded { limit: max_entries });
+                }
+                let metadata = entry.attrs;
+                let kind = match metadata.file_type() {
+                    FileType::Dir => SftpEntryKind::Directory,
+                    FileType::File => SftpEntryKind::File,
+                    FileType::Symlink => SftpEntryKind::Symlink,
+                    FileType::Other => SftpEntryKind::Other,
+                };
+                let path = join_remote_path(remote_path, &entry.filename);
+                entries.push(SftpEntry {
+                    name: entry.filename,
+                    path,
+                    kind,
+                    size: metadata.size,
+                    modified_unix_seconds: metadata.mtime,
+                    permissions: metadata
+                        .permissions
+                        .map(|_| metadata.permissions().to_string()),
+                });
+            }
+        }
+        raw.close(directory.handle).await?;
+        raw.close_session()?;
+        entries.sort_by(|left, right| {
+            let left_group = !matches!(left.kind, SftpEntryKind::Directory);
+            let right_group = !matches!(right.kind, SftpEntryKind::Directory);
+            left_group
+                .cmp(&right_group)
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        Ok(entries)
+    }
+
+    pub async fn download(
+        &self,
+        remote_path: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, NativeSshError> {
+        validate_remote_path(remote_path, false)?;
+        if max_bytes == 0 {
+            return Err(NativeSshError::InvalidSftpByteLimit);
+        }
+        let mut file = self.sftp.open(remote_path).await?;
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut chunk).await?;
+            if count == 0 {
+                break;
+            }
+            if output
+                .len()
+                .checked_add(count)
+                .is_none_or(|total| total > max_bytes)
+            {
+                let _ = file.close().await;
+                return Err(NativeSshError::SftpByteLimitExceeded { limit: max_bytes });
+            }
+            output.extend_from_slice(&chunk[..count]);
+        }
+        file.close().await?;
+        Ok(output)
+    }
+
+    /// Uploads to a unique sibling temporary file and publishes it with SFTP v3 rename. The
+    /// destination is never removed or truncated, so servers honoring the v3 no-overwrite rename
+    /// contract fail safely when the destination already exists.
+    pub async fn upload_new(
+        &self,
+        remote_path: &str,
+        contents: &[u8],
+        max_bytes: usize,
+    ) -> Result<SftpUploadResult, NativeSshError> {
+        validate_remote_path(remote_path, false)?;
+        if max_bytes == 0 {
+            return Err(NativeSshError::InvalidSftpByteLimit);
+        }
+        if contents.len() > max_bytes {
+            return Err(NativeSshError::SftpByteLimitExceeded { limit: max_bytes });
+        }
+        if self.sftp.try_exists(remote_path).await? {
+            return Err(NativeSshError::SftpDestinationExists(
+                remote_path.to_owned(),
+            ));
+        }
+        let temporary_path = temporary_upload_path(remote_path);
+        let result = async {
+            let mut file = self
+                .sftp
+                .open_with_flags(
+                    temporary_path.clone(),
+                    OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+                )
+                .await?;
+            let write_result = async {
+                file.write_all(contents).await?;
+                file.flush().await?;
+                file.sync_all().await?;
+                Ok::<_, NativeSshError>(())
+            }
+            .await;
+            let close_result = file.close().await;
+            write_result?;
+            close_result?;
+            self.sftp
+                .rename(temporary_path.clone(), remote_path)
+                .await?;
+            Ok::<_, NativeSshError>(SftpUploadResult {
+                remote_path: remote_path.to_owned(),
+                bytes_written: contents.len(),
+            })
+        }
+        .await;
+        if result.is_err() {
+            let _ = self.sftp.remove_file(temporary_path).await;
+        }
+        result
+    }
+
+    pub async fn close(self) -> Result<(), NativeSshError> {
+        self.sftp.close().await?;
+        self.handle
+            .disconnect(Disconnect::ByApplication, "SFTP complete", "en")
+            .await?;
+        Ok(())
+    }
+}
+
+fn validate_remote_path(path: &str, allow_directory: bool) -> Result<(), NativeSshError> {
+    if path.is_empty()
+        || path.len() > 4096
+        || path
+            .chars()
+            .any(|character| character == '\0' || character.is_control())
+        || (!allow_directory && path.ends_with('/'))
+    {
+        return Err(NativeSshError::InvalidSftpPath);
+    }
+    if !allow_directory {
+        let name = path.rsplit('/').next().unwrap_or_default();
+        if name.is_empty() || matches!(name, "." | "..") {
+            return Err(NativeSshError::InvalidSftpPath);
+        }
+    }
+    Ok(())
+}
+
+fn validate_remote_entry_name(name: &str) -> Result<(), NativeSshError> {
+    if name.is_empty()
+        || name.len() > 1024
+        || name.contains('/')
+        || name
+            .chars()
+            .any(|character| character == '\0' || character.is_control())
+    {
+        return Err(NativeSshError::InvalidSftpEntryName);
+    }
+    Ok(())
+}
+
+fn temporary_upload_path(remote_path: &str) -> String {
+    let parent = match remote_path.rsplit_once('/') {
+        Some(("", _)) if remote_path.starts_with('/') => "/",
+        Some((parent, _)) => parent,
+        None => "",
+    };
+    let separator = if parent.is_empty() || parent.ends_with('/') {
+        ""
+    } else {
+        "/"
+    };
+    format!("{parent}{separator}.yasc-upload-{}", Uuid::new_v4())
+}
+
+fn join_remote_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_owned()
+    } else if parent.ends_with('/') {
+        format!("{parent}{name}")
+    } else {
+        format!("{parent}/{name}")
+    }
 }
 
 impl NativeAgentCommandRequest {
@@ -950,6 +1304,133 @@ impl NativeSshEngine {
         )
         .await
     }
+
+    /// Opens an SFTP v3 session after the same fail-closed host-key verification used by terminal
+    /// and command sessions.
+    pub async fn connect_sftp(
+        &self,
+        request: NativeSftpRequest,
+        history: &HostKeyHistory,
+        policy: &HostKeyPolicy,
+    ) -> Result<NativeSftpSession, NativeSshError> {
+        let private_key = decode_private_key(
+            &request.private_key,
+            request.private_key_passphrase.as_ref(),
+        )?;
+        let captured = Arc::new(Mutex::new(None));
+        let handler = NativeHostKeyHandler {
+            history: history.clone(),
+            policy: policy.clone(),
+            captured: Arc::clone(&captured),
+        };
+        let config = Arc::new(client::Config {
+            inactivity_timeout: Some(self.handshake_timeout),
+            ..Default::default()
+        });
+        let address = (request.target.host().to_owned(), request.target.port());
+        let connect_result = timeout(
+            self.handshake_timeout,
+            client::connect(config, address, handler),
+        )
+        .await
+        .map_err(|_| NativeSshError::HandshakeTimeout)?;
+        let (mut handle, probe) = checked_connection(connect_result, &captured)?;
+        let rsa_hash = handle.best_supported_rsa_hash().await?.flatten();
+        let authentication = handle
+            .authenticate_publickey(
+                request.username,
+                PrivateKeyWithHashAlg::new(Arc::new(private_key), rsa_hash),
+            )
+            .await?;
+        if !authentication.success() {
+            return Err(NativeSshError::AuthenticationRejected);
+        }
+        open_sftp_session(handle, probe).await
+    }
+
+    /// Opens SFTP while keeping private-key operations inside the selected external SSH agent.
+    pub async fn connect_agent_sftp<S>(
+        &self,
+        request: NativeAgentSftpRequest,
+        agent: &mut AgentClient<S>,
+        history: &HostKeyHistory,
+        policy: &HostKeyPolicy,
+    ) -> Result<NativeSftpSession, NativeSshError>
+    where
+        S: russh::keys::agent::client::AgentStream + Send + Unpin,
+    {
+        let public_key = ssh_key::PublicKey::from_bytes(&request.external_key.public_key_blob)?;
+        let identities = agent.request_identities().await?;
+        if !identities.iter().any(|identity| {
+            matches!(identity, AgentIdentity::PublicKey { key, .. } if key == &public_key)
+        }) {
+            return Err(NativeSshError::AgentIdentityNotFound);
+        }
+        let captured = Arc::new(Mutex::new(None));
+        let handler = NativeHostKeyHandler {
+            history: history.clone(),
+            policy: policy.clone(),
+            captured: Arc::clone(&captured),
+        };
+        let config = Arc::new(client::Config {
+            inactivity_timeout: Some(self.handshake_timeout),
+            ..Default::default()
+        });
+        let address = (request.target.host().to_owned(), request.target.port());
+        let connect_result = timeout(
+            self.handshake_timeout,
+            client::connect(config, address, handler),
+        )
+        .await
+        .map_err(|_| NativeSshError::HandshakeTimeout)?;
+        let (mut handle, probe) = checked_connection(connect_result, &captured)?;
+        let rsa_hash = handle.best_supported_rsa_hash().await?.flatten();
+        let authentication = handle
+            .authenticate_publickey_with(request.username, public_key, rsa_hash, agent)
+            .await
+            .map_err(NativeSshError::AgentAuthentication)?;
+        if !authentication.success() {
+            return Err(NativeSshError::AuthenticationRejected);
+        }
+        open_sftp_session(handle, probe).await
+    }
+}
+
+fn checked_connection(
+    result: Result<client::Handle<NativeHostKeyHandler>, NativeSshError>,
+    captured: &Mutex<Option<NativeHostKeyProbe>>,
+) -> Result<(client::Handle<NativeHostKeyHandler>, NativeHostKeyProbe), NativeSshError> {
+    match result {
+        Ok(handle) => {
+            let probe = take_probe(captured)?;
+            if !probe.decision.is_accepted() {
+                return Err(NativeSshError::HostKeyRejected(probe.decision));
+            }
+            Ok((handle, probe))
+        }
+        Err(error) => match take_probe(captured) {
+            Ok(probe) if !probe.decision.is_accepted() => {
+                Err(NativeSshError::HostKeyRejected(probe.decision))
+            }
+            Ok(_) | Err(NativeSshError::MissingHostKey) => Err(error),
+            Err(other) => Err(other),
+        },
+    }
+}
+
+async fn open_sftp_session(
+    handle: client::Handle<NativeHostKeyHandler>,
+    probe: NativeHostKeyProbe,
+) -> Result<NativeSftpSession, NativeSshError> {
+    let mut channel = handle.channel_open_session().await?;
+    channel.request_subsystem(true, "sftp").await?;
+    wait_for_request_success(&mut channel, NativeSshError::SftpSubsystemRejected).await?;
+    let sftp = SftpSession::new(channel.into_stream()).await?;
+    Ok(NativeSftpSession {
+        handle,
+        sftp,
+        host_key_decision: probe.decision,
+    })
 }
 
 async fn run_authenticated_shell<R, O, E>(
@@ -1156,6 +1637,8 @@ pub enum NativeSshError {
     LocalIo(#[from] std::io::Error),
     #[error("native SSH transport failed: {0}")]
     Transport(#[from] russh::Error),
+    #[error("SFTP operation failed: {0}")]
+    Sftp(#[from] russh_sftp::client::error::Error),
     #[error("presented SSH host key could not be encoded: {0}")]
     KeyEncoding(#[from] ssh_key::Error),
     #[error("SSH key provider operation failed: {0}")]
@@ -1186,6 +1669,14 @@ pub enum NativeSshError {
     InvalidTerminalSize,
     #[error("terminal type must contain 1-64 safe ASCII characters")]
     InvalidTerminalType,
+    #[error("SFTP path must be 1-4096 characters without control bytes or an invalid filename")]
+    InvalidSftpPath,
+    #[error("remote SFTP directory returned an invalid entry name")]
+    InvalidSftpEntryName,
+    #[error("SFTP directory entry limit must be greater than zero")]
+    InvalidSftpEntryLimit,
+    #[error("SFTP byte limit must be greater than zero")]
+    InvalidSftpByteLimit,
     #[error("SSH private key must use a supported UTF-8 text format")]
     PrivateKeyNotUtf8,
     #[error("SSH private-key passphrase must be UTF-8")]
@@ -1206,12 +1697,20 @@ pub enum NativeSshError {
     PtyRequestRejected,
     #[error("remote server rejected the interactive shell request")]
     ShellRequestRejected,
+    #[error("remote server rejected the SFTP subsystem request")]
+    SftpSubsystemRejected,
     #[error("remote shell returned unsupported extended data type {0}")]
     UnsupportedExtendedData(u32),
     #[error("remote command exceeded its timeout")]
     CommandTimeout,
     #[error("remote command output exceeded the {limit}-byte limit")]
     OutputLimitExceeded { limit: usize },
+    #[error("remote directory exceeded the {limit}-entry limit")]
+    SftpEntryLimitExceeded { limit: usize },
+    #[error("remote file exceeded the {limit}-byte limit")]
+    SftpByteLimitExceeded { limit: usize },
+    #[error("remote destination already exists: {0}")]
+    SftpDestinationExists(String),
     #[error("remote command ended without an exit status")]
     MissingExitStatus,
     #[error("remote command ended from signal {0}")]
@@ -1221,6 +1720,7 @@ pub enum NativeSshError {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::{BTreeMap, HashMap},
         net::SocketAddr,
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -1230,6 +1730,9 @@ mod tests {
         keys::{PrivateKey, ssh_key::LineEnding},
         server,
         server::{Auth, ChannelOpenHandle, Server as _, Session},
+    };
+    use russh_sftp::protocol::{
+        Attrs, Data, File, FileAttributes, Handle, Name, Status, StatusCode, Version,
     };
     use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
     use yasc_domain::{HostId, HostKeyDecision, HostKeyHistory, HostKeyPolicy};
@@ -1241,6 +1744,8 @@ mod tests {
         authorized_key: Option<ssh_key::PublicKey>,
         authentication_attempts: Arc<AtomicUsize>,
         shell: Option<Arc<Mutex<ShellFixture>>>,
+        channels: Arc<tokio::sync::Mutex<HashMap<ChannelId, Channel<server::Msg>>>>,
+        sftp: Option<Arc<tokio::sync::Mutex<SftpFixture>>>,
     }
 
     #[derive(Debug)]
@@ -1262,6 +1767,231 @@ mod tests {
                 shell_requests: 0,
             }
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct SftpFixture {
+        files: BTreeMap<String, Vec<u8>>,
+        directories: Vec<String>,
+    }
+
+    struct TestSftpHandler {
+        fixture: Arc<tokio::sync::Mutex<SftpFixture>>,
+        directory_read: bool,
+        handles: HashMap<String, String>,
+    }
+
+    impl TestSftpHandler {
+        fn new(fixture: Arc<tokio::sync::Mutex<SftpFixture>>) -> Self {
+            Self {
+                fixture,
+                directory_read: false,
+                handles: HashMap::new(),
+            }
+        }
+
+        fn status(id: u32) -> Status {
+            Status {
+                id,
+                status_code: StatusCode::Ok,
+                error_message: "Ok".to_owned(),
+                language_tag: "en".to_owned(),
+            }
+        }
+
+        fn file_attributes(size: usize) -> FileAttributes {
+            FileAttributes {
+                size: Some(size as u64),
+                permissions: Some(0o100_644),
+                mtime: Some(1_700_000_000),
+                ..Default::default()
+            }
+        }
+
+        fn directory_attributes() -> FileAttributes {
+            FileAttributes {
+                size: Some(0),
+                permissions: Some(0o40_755),
+                mtime: Some(1_700_000_001),
+                ..Default::default()
+            }
+        }
+    }
+
+    impl russh_sftp::server::Handler for TestSftpHandler {
+        type Error = StatusCode;
+
+        fn unimplemented(&self) -> Self::Error {
+            StatusCode::OpUnsupported
+        }
+
+        async fn init(
+            &mut self,
+            _: u32,
+            _: HashMap<String, String>,
+        ) -> Result<Version, Self::Error> {
+            Ok(Version::new())
+        }
+
+        async fn open(
+            &mut self,
+            id: u32,
+            filename: String,
+            flags: OpenFlags,
+            _: FileAttributes,
+        ) -> Result<Handle, Self::Error> {
+            let mut fixture = self.fixture.lock().await;
+            let exists = fixture.files.contains_key(&filename);
+            if flags.contains(OpenFlags::CREATE) {
+                if exists && flags.contains(OpenFlags::EXCLUDE) {
+                    return Err(StatusCode::Failure);
+                }
+                fixture.files.entry(filename.clone()).or_default();
+            } else if !exists {
+                return Err(StatusCode::NoSuchFile);
+            }
+            let handle = format!("file-{id}");
+            self.handles.insert(handle.clone(), filename);
+            Ok(Handle { id, handle })
+        }
+
+        async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
+            self.handles.remove(&handle);
+            Ok(Self::status(id))
+        }
+
+        async fn read(
+            &mut self,
+            id: u32,
+            handle: String,
+            offset: u64,
+            len: u32,
+        ) -> Result<Data, Self::Error> {
+            let path = self.handles.get(&handle).ok_or(StatusCode::NoSuchFile)?;
+            let fixture = self.fixture.lock().await;
+            let contents = fixture.files.get(path).ok_or(StatusCode::NoSuchFile)?;
+            let offset = usize::try_from(offset).map_err(|_| StatusCode::Failure)?;
+            if offset >= contents.len() {
+                return Err(StatusCode::Eof);
+            }
+            let end = offset.saturating_add(len as usize).min(contents.len());
+            Ok(Data {
+                id,
+                data: contents[offset..end].to_vec(),
+            })
+        }
+
+        async fn write(
+            &mut self,
+            id: u32,
+            handle: String,
+            offset: u64,
+            data: Vec<u8>,
+        ) -> Result<Status, Self::Error> {
+            let path = self.handles.get(&handle).ok_or(StatusCode::NoSuchFile)?;
+            let mut fixture = self.fixture.lock().await;
+            let contents = fixture.files.get_mut(path).ok_or(StatusCode::NoSuchFile)?;
+            let offset = usize::try_from(offset).map_err(|_| StatusCode::Failure)?;
+            let end = offset.checked_add(data.len()).ok_or(StatusCode::Failure)?;
+            if contents.len() < end {
+                contents.resize(end, 0);
+            }
+            contents[offset..end].copy_from_slice(&data);
+            Ok(Self::status(id))
+        }
+
+        async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+            let fixture = self.fixture.lock().await;
+            if let Some(contents) = fixture.files.get(&path) {
+                return Ok(Attrs {
+                    id,
+                    attrs: Self::file_attributes(contents.len()),
+                });
+            }
+            if matches!(path.as_str(), "/" | ".") || fixture.directories.contains(&path) {
+                return Ok(Attrs {
+                    id,
+                    attrs: Self::directory_attributes(),
+                });
+            }
+            Err(StatusCode::NoSuchFile)
+        }
+
+        async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+            self.stat(id, path).await
+        }
+
+        async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
+            let fixture = self.fixture.lock().await;
+            if !matches!(path.as_str(), "/" | ".") && !fixture.directories.contains(&path) {
+                return Err(StatusCode::NoSuchFile);
+            }
+            drop(fixture);
+            self.directory_read = false;
+            let handle = format!("dir-{id}");
+            self.handles.insert(handle.clone(), path);
+            Ok(Handle { id, handle })
+        }
+
+        async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
+            let path = self.handles.get(&handle).ok_or(StatusCode::NoSuchFile)?;
+            if self.directory_read {
+                return Err(StatusCode::Eof);
+            }
+            self.directory_read = true;
+            let fixture = self.fixture.lock().await;
+            let prefix = if matches!(path.as_str(), "/" | ".") {
+                "/"
+            } else {
+                path.as_str()
+            };
+            let mut files = Vec::new();
+            for directory in &fixture.directories {
+                if let Some(name) = direct_child(prefix, directory) {
+                    files.push(File::new(name, Self::directory_attributes()));
+                }
+            }
+            for (filename, contents) in &fixture.files {
+                if let Some(name) = direct_child(prefix, filename) {
+                    files.push(File::new(name, Self::file_attributes(contents.len())));
+                }
+            }
+            Ok(Name { id, files })
+        }
+
+        async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
+            let removed = self.fixture.lock().await.files.remove(&filename);
+            removed
+                .map(|_| Self::status(id))
+                .ok_or(StatusCode::NoSuchFile)
+        }
+
+        async fn rename(
+            &mut self,
+            id: u32,
+            oldpath: String,
+            newpath: String,
+        ) -> Result<Status, Self::Error> {
+            let mut fixture = self.fixture.lock().await;
+            if fixture.files.contains_key(&newpath) {
+                return Err(StatusCode::Failure);
+            }
+            let contents = fixture
+                .files
+                .remove(&oldpath)
+                .ok_or(StatusCode::NoSuchFile)?;
+            fixture.files.insert(newpath, contents);
+            Ok(Self::status(id))
+        }
+    }
+
+    fn direct_child<'a>(parent: &str, path: &'a str) -> Option<&'a str> {
+        let suffix = if parent == "/" {
+            path.strip_prefix('/')?
+        } else {
+            path.strip_prefix(parent)?.strip_prefix('/')?
+        };
+        (!suffix.is_empty() && !suffix.contains('/')).then_some(suffix)
     }
 
     impl server::Server for TestServer {
@@ -1290,11 +2020,33 @@ mod tests {
 
         async fn channel_open_session(
             &mut self,
-            _: Channel<server::Msg>,
+            channel: Channel<server::Msg>,
             reply: ChannelOpenHandle,
             _: &mut Session,
         ) -> Result<(), Self::Error> {
+            self.channels.lock().await.insert(channel.id(), channel);
             reply.accept().await;
+            Ok(())
+        }
+
+        async fn subsystem_request(
+            &mut self,
+            channel: ChannelId,
+            name: &str,
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            let Some(fixture) = self.sftp.clone().filter(|_| name == "sftp") else {
+                session.channel_failure(channel)?;
+                return Ok(());
+            };
+            let Some(channel) = self.channels.lock().await.remove(&channel) else {
+                session.channel_failure(channel)?;
+                return Ok(());
+            };
+            session.channel_success(channel.id())?;
+            tokio::spawn(async move {
+                russh_sftp::server::run(channel.into_stream(), TestSftpHandler::new(fixture)).await;
+            });
             Ok(())
         }
 
@@ -1423,6 +2175,20 @@ mod tests {
         JoinHandle<std::io::Result<()>>,
         Arc<AtomicUsize>,
     ) {
+        start_server_with_fixtures(key, authorized_key, shell, None).await
+    }
+
+    async fn start_server_with_fixtures(
+        key: PrivateKey,
+        authorized_key: Option<ssh_key::PublicKey>,
+        shell: Option<Arc<Mutex<ShellFixture>>>,
+        sftp: Option<Arc<tokio::sync::Mutex<SftpFixture>>>,
+    ) -> (
+        SocketAddr,
+        russh::server::RunningServerHandle,
+        JoinHandle<std::io::Result<()>>,
+        Arc<AtomicUsize>,
+    ) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let config = Arc::new(server::Config {
@@ -1439,6 +2205,8 @@ mod tests {
                 authorized_key,
                 authentication_attempts: server_attempts,
                 shell,
+                channels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                sftp,
             };
             let running = server.run_on_socket(config, &listener);
             assert!(handle_sender.send(running.handle()).is_ok());
@@ -1605,6 +2373,239 @@ mod tests {
             Err(NativeSshError::AuthenticationRejected)
         ));
         assert_eq!(authentication_attempts.load(Ordering::SeqCst), 3);
+
+        shutdown.shutdown("test complete".to_owned());
+        task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn sftp_paths_and_limits_are_validated_before_network_io() {
+        assert!(validate_remote_path("/srv/files", true).is_ok());
+        assert!(validate_remote_path(".", true).is_ok());
+        for path in ["", "/srv/file\0name", "/srv/file\nname", "/srv/", ".", ".."] {
+            assert!(matches!(
+                validate_remote_path(path, false),
+                Err(NativeSshError::InvalidSftpPath)
+            ));
+        }
+        for name in ["", "../escape", "nested/file", "line\nbreak"] {
+            assert!(matches!(
+                validate_remote_entry_name(name),
+                Err(NativeSshError::InvalidSftpEntryName)
+            ));
+        }
+        assert!(validate_remote_entry_name("safe file.txt").is_ok());
+        assert!(temporary_upload_path("/srv/file.txt").starts_with("/srv/.yasc-upload-"));
+        assert!(temporary_upload_path("/file.txt").starts_with("/.yasc-upload-"));
+        assert!(temporary_upload_path("file.txt").starts_with(".yasc-upload-"));
+    }
+
+    #[tokio::test]
+    async fn sftp_lists_bounds_download_and_publishes_new_files_without_overwrite() {
+        let server_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let encoded_client_key = client_key.to_openssh(LineEnding::LF).unwrap();
+        let fixture = Arc::new(tokio::sync::Mutex::new(SftpFixture {
+            files: BTreeMap::from([
+                ("/zeta.txt".to_owned(), b"unchanged".to_vec()),
+                ("/large.bin".to_owned(), vec![7; 16]),
+            ]),
+            directories: vec!["/folder".to_owned()],
+        }));
+        let (address, shutdown, task, authentication_attempts) = start_server_with_fixtures(
+            server_key.clone(),
+            Some(client_key.public_key().clone()),
+            None,
+            Some(Arc::clone(&fixture)),
+        )
+        .await;
+        let target = format!("127.0.0.1:{}", address.port())
+            .parse::<SshTarget>()
+            .unwrap();
+        let mut history = HostKeyHistory::new(HostId::new());
+        history
+            .trust_first_use(
+                HostKeyObservation::presented(
+                    HostKeyMaterial::new(
+                        HostKeyAlgorithm::new(server_key.public_key().algorithm().to_string())
+                            .unwrap(),
+                        server_key.public_key().to_bytes().unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                10,
+            )
+            .unwrap();
+        let request = NativeSftpRequest::new(
+            target.clone(),
+            "fixture-user",
+            SecretBytes::new(encoded_client_key.as_bytes().to_vec()),
+        )
+        .unwrap();
+        let engine = NativeSshEngine::new(Duration::from_secs(5));
+        let session = engine
+            .connect_sftp(request, &history, &HostKeyPolicy::strict())
+            .await
+            .unwrap();
+
+        let entries = session.list_directory("/", 10).await.unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["folder", "large.bin", "zeta.txt"]
+        );
+        assert_eq!(entries[0].kind, SftpEntryKind::Directory);
+        assert_eq!(entries[1].size, Some(16));
+        assert!(matches!(
+            session.list_directory("/", 2).await,
+            Err(NativeSshError::SftpEntryLimitExceeded { limit: 2 })
+        ));
+        assert_eq!(
+            session.download("/zeta.txt", 32).await.unwrap(),
+            b"unchanged"
+        );
+        assert!(matches!(
+            session.download("/large.bin", 8).await,
+            Err(NativeSshError::SftpByteLimitExceeded { limit: 8 })
+        ));
+
+        let uploaded = session
+            .upload_new("/new.txt", b"new payload", 32)
+            .await
+            .unwrap();
+        assert_eq!(uploaded.bytes_written, 11);
+        assert!(matches!(
+            session.upload_new("/zeta.txt", b"replacement", 32).await,
+            Err(NativeSshError::SftpDestinationExists(path)) if path == "/zeta.txt"
+        ));
+        assert!(matches!(
+            session.upload_new("/too-large", b"12345", 4).await,
+            Err(NativeSshError::SftpByteLimitExceeded { limit: 4 })
+        ));
+        session.close().await.unwrap();
+
+        let fixture = fixture.lock().await;
+        assert_eq!(fixture.files.get("/new.txt").unwrap(), b"new payload");
+        assert_eq!(fixture.files.get("/zeta.txt").unwrap(), b"unchanged");
+        assert!(
+            fixture
+                .files
+                .keys()
+                .all(|path| !path.contains(".yasc-upload-"))
+        );
+        drop(fixture);
+        assert_eq!(authentication_attempts.load(Ordering::SeqCst), 1);
+
+        let rejected = NativeSftpRequest::new(
+            target,
+            "fixture-user",
+            SecretBytes::new(encoded_client_key.as_bytes().to_vec()),
+        )
+        .unwrap();
+        assert!(matches!(
+            engine
+                .connect_sftp(
+                    rejected,
+                    &HostKeyHistory::new(HostId::new()),
+                    &HostKeyPolicy::strict(),
+                )
+                .await,
+            Err(NativeSshError::HostKeyRejected(_))
+        ));
+        assert_eq!(authentication_attempts.load(Ordering::SeqCst), 1);
+
+        shutdown.shutdown("test complete".to_owned());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sftp_signs_with_agent_and_rejects_a_missing_identity_before_connecting() {
+        let server_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let client_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let fixture = Arc::new(tokio::sync::Mutex::new(SftpFixture {
+            files: BTreeMap::from([("/agent.txt".to_owned(), b"agent payload".to_vec())]),
+            directories: Vec::new(),
+        }));
+        let (address, shutdown, task, authentication_attempts) = start_server_with_fixtures(
+            server_key.clone(),
+            Some(client_key.public_key().clone()),
+            None,
+            Some(fixture),
+        )
+        .await;
+        let mut history = HostKeyHistory::new(HostId::new());
+        history
+            .trust_first_use(
+                HostKeyObservation::presented(
+                    HostKeyMaterial::new(
+                        HostKeyAlgorithm::new(server_key.public_key().algorithm().to_string())
+                            .unwrap(),
+                        server_key.public_key().to_bytes().unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                10,
+            )
+            .unwrap();
+        let (agent_client_stream, agent_server_stream) = tokio::io::duplex(64 * 1024);
+        let listener = futures::stream::iter([Ok::<_, std::io::Error>(agent_server_stream)]);
+        tokio::spawn(async move {
+            russh::keys::agent::server::serve(listener, ())
+                .await
+                .unwrap();
+        });
+        let mut agent = AgentClient::connect(agent_client_stream);
+        agent.add_identity(&client_key, &[]).await.unwrap();
+        let selected = list_agent_identities(&mut agent).await.unwrap()[0]
+            .external_reference()
+            .unwrap();
+        let request = NativeAgentSftpRequest::new(
+            format!("127.0.0.1:{}", address.port())
+                .parse::<SshTarget>()
+                .unwrap(),
+            "fixture-user",
+            selected,
+        )
+        .unwrap();
+        let engine = NativeSshEngine::new(Duration::from_secs(5));
+        let session = engine
+            .connect_agent_sftp(request, &mut agent, &history, &HostKeyPolicy::strict())
+            .await
+            .unwrap();
+        assert_eq!(
+            session.download("/agent.txt", 32).await.unwrap(),
+            b"agent payload"
+        );
+        session.close().await.unwrap();
+        assert_eq!(authentication_attempts.load(Ordering::SeqCst), 1);
+
+        let missing_key =
+            PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+        let missing_reference = ExternalKeyReference::new(
+            missing_key.public_key().algorithm().to_string(),
+            missing_key.public_key().to_bytes().unwrap(),
+            None,
+        )
+        .unwrap();
+        let missing_request = NativeAgentSftpRequest::new(
+            "127.0.0.1:1".parse::<SshTarget>().unwrap(),
+            "fixture-user",
+            missing_reference,
+        )
+        .unwrap();
+        assert!(matches!(
+            engine
+                .connect_agent_sftp(
+                    missing_request,
+                    &mut agent,
+                    &HostKeyHistory::new(HostId::new()),
+                    &HostKeyPolicy::strict(),
+                )
+                .await,
+            Err(NativeSshError::AgentIdentityNotFound)
+        ));
 
         shutdown.shutdown("test complete".to_owned());
         task.await.unwrap().unwrap();

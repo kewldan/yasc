@@ -5,9 +5,10 @@
 mod native;
 
 pub use native::{
-    AgentIdentityInfo, DynamicAgentClient, NativeAgentCommandRequest, NativeAgentShellRequest,
-    NativeCommandOutput, NativeCommandRequest, NativeHostKeyProbe, NativeShellIo,
-    NativeShellOutput, NativeShellRequest, NativeSshEngine, NativeSshError, TerminalSize,
+    AgentIdentityInfo, DynamicAgentClient, NativeAgentCommandRequest, NativeAgentSftpRequest,
+    NativeAgentShellRequest, NativeCommandOutput, NativeCommandRequest, NativeHostKeyProbe,
+    NativeSftpRequest, NativeSftpSession, NativeShellIo, NativeShellOutput, NativeShellRequest,
+    NativeSshEngine, NativeSshError, SftpEntry, SftpEntryKind, SftpUploadResult, TerminalSize,
     connect_agent, external_key_fingerprint, list_agent_identities, validate_private_key,
 };
 

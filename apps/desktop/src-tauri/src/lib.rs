@@ -24,8 +24,9 @@ use yasc_domain::{
 };
 use yasc_platform::{PlatformError, PlatformPaths};
 use yasc_ssh::{
-    NativeAgentShellRequest, NativeHostKeyProbe, NativeShellIo, NativeSshEngine, NativeSshError,
-    TerminalSize, connect_agent, external_key_fingerprint,
+    NativeAgentSftpRequest, NativeAgentShellRequest, NativeHostKeyProbe, NativeSftpSession,
+    NativeShellIo, NativeSshEngine, NativeSshError, SftpEntry, SftpUploadResult, TerminalSize,
+    connect_agent, external_key_fingerprint,
     list_agent_identities as query_agent_identities,
 };
 use yasc_storage::{PersistedCredential, SqliteStorage, StorageError};
@@ -170,6 +171,8 @@ enum DesktopError {
     SessionNotFound(String),
     #[error("terminal input chunk exceeds 65536 bytes")]
     InputTooLarge,
+    #[error("SFTP upload chunk exceeds 10485760 bytes")]
+    SftpUploadTooLarge,
     #[error("system clock is outside the supported range")]
     InvalidClock,
     #[error("terminal I/O failed: {0}")]
@@ -466,6 +469,74 @@ fn resolve_agent_session(
     Ok((host, history, provider, external_key))
 }
 
+async fn connect_agent_sftp(
+    state: &DesktopState,
+    host_id: HostId,
+    credential_id: CredentialId,
+) -> Result<NativeSftpSession, DesktopError> {
+    let (host, history, provider, external_key) = {
+        let storage = database(state)?;
+        resolve_agent_session(&storage, host_id, credential_id)?
+    };
+    let username = host
+        .target
+        .username()
+        .ok_or(DesktopError::UsernameRequired)?
+        .to_owned();
+    let request = NativeAgentSftpRequest::new(host.target, username, external_key)?;
+    let mut agent = connect_agent(provider).await?;
+    Ok(NativeSshEngine::default()
+        .connect_agent_sftp(request, &mut agent, &history, &HostKeyPolicy::strict())
+        .await?)
+}
+
+#[tauri::command]
+async fn list_sftp_directory(
+    state: tauri::State<'_, DesktopState>,
+    host_id: HostId,
+    credential_id: CredentialId,
+    remote_path: String,
+    max_entries: usize,
+) -> Result<Vec<SftpEntry>, DesktopError> {
+    let session = connect_agent_sftp(&state, host_id, credential_id).await?;
+    let entries = session.list_directory(&remote_path, max_entries).await?;
+    session.close().await?;
+    Ok(entries)
+}
+
+#[tauri::command]
+async fn read_sftp_file(
+    state: tauri::State<'_, DesktopState>,
+    host_id: HostId,
+    credential_id: CredentialId,
+    remote_path: String,
+    max_bytes: usize,
+) -> Result<Vec<u8>, DesktopError> {
+    let session = connect_agent_sftp(&state, host_id, credential_id).await?;
+    let contents = session.download(&remote_path, max_bytes).await?;
+    session.close().await?;
+    Ok(contents)
+}
+
+#[tauri::command]
+async fn upload_sftp_file(
+    state: tauri::State<'_, DesktopState>,
+    host_id: HostId,
+    credential_id: CredentialId,
+    remote_path: String,
+    contents: Vec<u8>,
+) -> Result<SftpUploadResult, DesktopError> {
+    if contents.len() > 10 * 1024 * 1024 {
+        return Err(DesktopError::SftpUploadTooLarge);
+    }
+    let session = connect_agent_sftp(&state, host_id, credential_id).await?;
+    let result = session
+        .upload_new(&remote_path, &contents, 10 * 1024 * 1024)
+        .await?;
+    session.close().await?;
+    Ok(result)
+}
+
 #[tauri::command]
 async fn start_agent_session(
     state: tauri::State<'_, DesktopState>,
@@ -618,6 +689,9 @@ pub fn run() {
             write_session,
             resize_session,
             close_session,
+            list_sftp_directory,
+            read_sftp_file,
+            upload_sftp_file,
         ])
         .run(tauri::generate_context!())
         .expect("YASC desktop runtime failed");

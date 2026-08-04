@@ -16,6 +16,7 @@ crossterm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tempfile = "3"
 tokio.workspace = true
 yasc-domain.workspace = true
 yasc-platform.workspace = true
@@ -27,7 +28,6 @@ yasc-vault.workspace = true
 futures = "0.3"
 rand = "0.10"
 russh = { version = "0.62.5", default-features = false, features = ["ring", "rsa"] }
-tempfile = "3"
 
 [lints]
 workspace = true

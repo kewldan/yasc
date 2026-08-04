@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { CredentialSummary, Host } from "./api";
-import { credentialsForHost, formatTarget } from "./model";
+import {
+  credentialsForHost,
+  formatTarget,
+  hostInitial,
+  remoteChild,
+  remoteParent,
+} from "./model";
 
 const host: Host = {
   id: "host-1",
@@ -44,5 +50,18 @@ describe("desktop view model", () => {
     ];
 
     expect(credentialsForHost(credentials, "host-1").map((item) => item.id)).toEqual(["allowed"]);
+  });
+
+  it("builds and traverses normalized remote paths", () => {
+    expect(remoteChild("/", "var")).toBe("/var");
+    expect(remoteChild("/var/", "log")).toBe("/var/log");
+    expect(remoteParent("/var/log/")).toBe("/var");
+    expect(remoteParent("/var")).toBe("/");
+    expect(remoteParent("/")).toBe("/");
+  });
+
+  it("uses a stable host initial", () => {
+    expect(hostInitial(host)).toBe("P");
+    expect(hostInitial({ ...host, label: "  " })).toBe(">");
   });
 });

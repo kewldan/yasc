@@ -26,7 +26,8 @@ tests/                 Cross-crate and compatibility fixtures
 ```
 
 The macOS Desktop MVP now provides local inventory, external-agent credential registration,
-explicit first-use host-key trust, and a native interactive SSH terminal. Product documentation
+explicit first-use host-key trust, a native interactive SSH terminal, and a bounded native SFTP
+browser with create-only upload. Product documentation
 lives in the separate
 [YASC documentation repository](https://github.com/kewldan/yasc-docs).
 
@@ -138,6 +139,12 @@ cargo run -p yasc-cli -- --database ./yasc.db exec <HOST_ID> \
   --credential <CREDENTIAL_ID> 'uname -a'
 cargo run -p yasc-cli -- --database ./yasc.db shell <HOST_ID> \
   --credential <CREDENTIAL_ID>
+cargo run -p yasc-cli -- --database ./yasc.db sftp list <HOST_ID> /var/log \
+  --credential <CREDENTIAL_ID>
+cargo run -p yasc-cli -- --database ./yasc.db sftp download <HOST_ID> \
+  /var/log/app.log ./app.log --credential <CREDENTIAL_ID> --max-bytes 104857600
+cargo run -p yasc-cli -- --database ./yasc.db sftp upload <HOST_ID> \
+  ./release.tar /srv/releases/release.tar --credential <CREDENTIAL_ID> --max-bytes 104857600
 ```
 
 The native command path requires a username in the stored target, applies strict persistent
@@ -151,6 +158,12 @@ terminal contents, propagate terminal-size changes, and restore local raw mode o
 path. External-agent credentials persist only the selected public key, fingerprint metadata,
 provider, and host grant; the agent performs every signature and the private key is never exported
 to YASC. Native-keystore unlock is still in development.
+
+Native SFTP uses the same strict host-key and host-scoped credential checks as terminal sessions.
+Directory results and downloads are bounded. Upload writes a unique exclusive sibling temporary
+file and publishes it with SFTP v3 rename; it never deletes or truncates an existing destination.
+CLI downloads persist through a local no-clobber temporary file. Resume, checksums, conflict UX,
+remote editing, cancellation, and transfer recovery remain planned queue work.
 
 The same core format, lint, and test gates run on Linux, macOS, and Windows in GitHub Actions. A
 separate macOS job tests both Desktop layers and builds the application bundle in parallel.

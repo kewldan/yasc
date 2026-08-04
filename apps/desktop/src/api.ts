@@ -37,6 +37,20 @@ export type HostKeyProbe = {
   canTrustFirstUse: boolean;
 };
 
+export type SftpEntry = {
+  name: string;
+  path: string;
+  kind: "directory" | "file" | "symlink" | "other";
+  size: number | null;
+  modifiedUnixSeconds: number | null;
+  permissions: string | null;
+};
+
+export type SftpUploadResult = {
+  remotePath: string;
+  bytesWritten: number;
+};
+
 export type TerminalEvent =
   | { type: "data"; stream: "stdout" | "stderr"; data: number[] }
   | { type: "exit"; status: number }
@@ -142,4 +156,47 @@ export async function resizeSession(
 
 export async function closeSession(sessionId: string): Promise<void> {
   await invoke("close_session", { sessionId });
+}
+
+export async function listSftpDirectory(
+  hostId: string,
+  credentialId: string,
+  remotePath: string,
+  maxEntries = 2_000,
+): Promise<SftpEntry[]> {
+  return invoke<SftpEntry[]>("list_sftp_directory", {
+    hostId,
+    credentialId,
+    remotePath,
+    maxEntries,
+  });
+}
+
+export async function readSftpFile(
+  hostId: string,
+  credentialId: string,
+  remotePath: string,
+  maxBytes = 1_048_576,
+): Promise<Uint8Array> {
+  const contents = await invoke<number[]>("read_sftp_file", {
+    hostId,
+    credentialId,
+    remotePath,
+    maxBytes,
+  });
+  return Uint8Array.from(contents);
+}
+
+export async function uploadSftpFile(
+  hostId: string,
+  credentialId: string,
+  remotePath: string,
+  contents: Uint8Array,
+): Promise<SftpUploadResult> {
+  return invoke<SftpUploadResult>("upload_sftp_file", {
+    hostId,
+    credentialId,
+    remotePath,
+    contents: Array.from(contents),
+  });
 }

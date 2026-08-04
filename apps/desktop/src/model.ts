@@ -15,3 +15,18 @@ export function credentialsForHost(
     (credential) => credential.usableForNativeAgent && credential.hostIds.includes(hostId),
   );
 }
+
+export function remoteParent(path: string): string {
+  if (path === "/" || path === ".") return "/";
+  const normalized = path.replace(/\/+$/, "");
+  const split = normalized.lastIndexOf("/");
+  return split <= 0 ? "/" : normalized.slice(0, split);
+}
+
+export function remoteChild(parent: string, name: string): string {
+  return parent === "/" ? `/${name}` : `${parent.replace(/\/+$/, "")}/${name}`;
+}
+
+export function hostInitial(host: Host): string {
+  return host.label.trim().slice(0, 1).toUpperCase() || ">";
+}

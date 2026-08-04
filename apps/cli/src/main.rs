@@ -23,10 +23,10 @@ use yasc_domain::{
 use yasc_platform::{PlatformError, PlatformPaths};
 use yasc_ssh::{
     ConnectionPlan, HostKeyPolicy as OpenSshHostKeyPolicy, NativeAgentCommandRequest,
-    NativeAgentShellRequest, NativeCommandRequest, NativeShellIo, NativeShellRequest,
-    NativeSshEngine, NativeSshError, OpenSshEngine, OpenSshError, OpenSshRequest, SshEngine,
-    TerminalSize, connect_agent, external_key_fingerprint, list_agent_identities,
-    validate_private_key,
+    NativeAgentSftpRequest, NativeAgentShellRequest, NativeCommandRequest, NativeSftpRequest,
+    NativeSftpSession, NativeShellIo, NativeShellRequest, NativeSshEngine, NativeSshError,
+    OpenSshEngine, OpenSshError, OpenSshRequest, SshEngine, TerminalSize, connect_agent,
+    external_key_fingerprint, list_agent_identities, validate_private_key,
 };
 use yasc_storage::{SqliteStorage, StorageError};
 use yasc_vault::{EncryptedVault, SecretBytes, SecretKind, VaultBackend, VaultError};
@@ -51,6 +51,11 @@ enum Command {
     Exec(NativeExecArgs),
     /// Open an interactive shell through the native SSH engine.
     Shell(NativeShellArgs),
+    /// Browse and transfer files through the native SFTP engine.
+    Sftp {
+        #[command(subcommand)]
+        command: SftpCommand,
+    },
     /// Manage the local host inventory.
     Host {
         #[command(subcommand)]
@@ -76,6 +81,75 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SftpCommand {
+    /// List a remote directory with bounded metadata output.
+    List(SftpListArgs),
+    /// Download a bounded remote file without replacing a local destination.
+    Download(SftpDownloadArgs),
+    /// Upload a bounded local file without replacing a remote destination.
+    Upload(SftpUploadArgs),
+}
+
+#[derive(Debug, Args)]
+struct SftpAuthenticationArgs {
+    /// Inventory host identifier. The host target must include a username.
+    host_id: HostId,
+    /// Private key in an OpenSSH, PKCS#8, PEM, or supported PuTTY text format.
+    #[arg(long, value_name = "PATH")]
+    identity: Option<PathBuf>,
+    /// Local-vault or external-agent credential identifier.
+    #[arg(long, value_name = "ID")]
+    credential: Option<CredentialId>,
+    /// File containing the local vault password. Required only for local-vault credentials.
+    #[arg(long, value_name = "PATH")]
+    vault_password_file: Option<PathBuf>,
+    /// File containing the private-key passphrase. Trailing CR/LF bytes are removed.
+    #[arg(long, value_name = "PATH")]
+    passphrase_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct SftpListArgs {
+    #[command(flatten)]
+    authentication: SftpAuthenticationArgs,
+    /// Remote directory path.
+    #[arg(default_value = ".")]
+    remote_path: String,
+    /// Maximum number of returned entries.
+    #[arg(long, default_value_t = 10_000)]
+    max_entries: usize,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct SftpDownloadArgs {
+    #[command(flatten)]
+    authentication: SftpAuthenticationArgs,
+    /// Remote file path.
+    remote_path: String,
+    /// New local destination path. Existing files are never replaced.
+    local_path: PathBuf,
+    /// Maximum accepted remote file size.
+    #[arg(long, default_value_t = 104_857_600)]
+    max_bytes: usize,
+}
+
+#[derive(Debug, Args)]
+struct SftpUploadArgs {
+    #[command(flatten)]
+    authentication: SftpAuthenticationArgs,
+    /// Existing local source path.
+    local_path: PathBuf,
+    /// New remote destination path. Existing files are never replaced.
+    remote_path: String,
+    /// Maximum accepted local file size.
+    #[arg(long, default_value_t = 104_857_600)]
+    max_bytes: usize,
 }
 
 #[derive(Debug, Args)]
@@ -550,6 +624,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         }
         Command::Exec(args) => run_native_exec(cli.database, args).await?,
         Command::Shell(args) => run_native_shell(cli.database, args).await?,
+        Command::Sftp { command } => run_sftp_command(cli.database, command).await?,
         Command::Host { command } => run_host_command(cli.database, command)?,
         Command::HostKey { command } => run_host_key_command(cli.database, command).await?,
         Command::Vault { command } => run_vault_command(cli.database, command)?,
@@ -1002,6 +1077,162 @@ async fn run_native_shell(
     if output.exit_status() != 0 {
         return Err(CliError::RemoteCommandExit(output.exit_status()));
     }
+    Ok(())
+}
+
+async fn run_sftp_command(database: Option<PathBuf>, command: SftpCommand) -> Result<(), CliError> {
+    match command {
+        SftpCommand::List(args) => {
+            let session = connect_cli_sftp(database, args.authentication).await?;
+            let entries = session
+                .list_directory(&args.remote_path, args.max_entries)
+                .await?;
+            session.close().await?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if entries.is_empty() {
+                println!("No remote entries");
+            } else {
+                for entry in entries {
+                    println!(
+                        "{:?}\t{}\t{}\t{}",
+                        entry.kind,
+                        entry
+                            .size
+                            .map_or_else(|| "-".to_owned(), |size| size.to_string()),
+                        entry.permissions.as_deref().unwrap_or("---------"),
+                        entry.path,
+                    );
+                }
+            }
+        }
+        SftpCommand::Download(args) => {
+            if args.max_bytes == 0 {
+                return Err(CliError::InvalidTransferLimit);
+            }
+            if args.local_path.exists() {
+                return Err(CliError::LocalDestinationExists(args.local_path));
+            }
+            let session = connect_cli_sftp(database, args.authentication).await?;
+            let contents = session.download(&args.remote_path, args.max_bytes).await?;
+            session.close().await?;
+            persist_new_local_file(&args.local_path, &contents)?;
+            println!(
+                "Downloaded {} bytes to {}",
+                contents.len(),
+                args.local_path.display()
+            );
+        }
+        SftpCommand::Upload(args) => {
+            let contents = read_bounded_local_file(&args.local_path, args.max_bytes)?;
+            let session = connect_cli_sftp(database, args.authentication).await?;
+            let result = session
+                .upload_new(&args.remote_path, &contents, args.max_bytes)
+                .await?;
+            session.close().await?;
+            println!(
+                "Uploaded {} bytes to {}",
+                result.bytes_written, result.remote_path
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn connect_cli_sftp(
+    database: Option<PathBuf>,
+    authentication: SftpAuthenticationArgs,
+) -> Result<NativeSftpSession, CliError> {
+    let storage = open_storage(database)?;
+    let host = storage
+        .find_host(authentication.host_id)?
+        .ok_or(CliError::HostNotFound(authentication.host_id))?;
+    let username = host
+        .target
+        .username()
+        .ok_or(CliError::NativeUsernameRequired)?
+        .to_owned();
+    let history = storage.load_host_key_history(authentication.host_id)?;
+    let resolved = resolve_native_authentication(
+        storage,
+        authentication.host_id,
+        authentication.identity.as_deref(),
+        authentication.credential,
+        authentication.vault_password_file.as_deref(),
+        authentication.passphrase_file.as_deref(),
+    )?;
+    let engine = NativeSshEngine::default();
+    match resolved {
+        ResolvedNativeAuthentication::PrivateKey {
+            private_key,
+            passphrase,
+        } => {
+            let mut request = NativeSftpRequest::new(host.target, username, private_key)?;
+            if let Some(passphrase) = passphrase {
+                request = request.with_passphrase(passphrase);
+            }
+            Ok(engine
+                .connect_sftp(request, &history, &HostKeyPolicy::strict())
+                .await?)
+        }
+        ResolvedNativeAuthentication::Agent {
+            provider,
+            external_key,
+        } => {
+            let request = NativeAgentSftpRequest::new(host.target, username, external_key)?;
+            let mut agent = connect_agent(provider).await?;
+            Ok(engine
+                .connect_agent_sftp(request, &mut agent, &history, &HostKeyPolicy::strict())
+                .await?)
+        }
+    }
+}
+
+fn read_bounded_local_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, CliError> {
+    if max_bytes == 0 {
+        return Err(CliError::InvalidTransferLimit);
+    }
+    let file = fs::File::open(path).map_err(|source| CliError::ReadTransferFile {
+        path: path.to_owned(),
+        source,
+    })?;
+    let size = file
+        .metadata()
+        .map_err(|source| CliError::ReadTransferFile {
+            path: path.to_owned(),
+            source,
+        })?
+        .len();
+    if size > max_bytes as u64 {
+        return Err(CliError::LocalTransferLimitExceeded { limit: max_bytes });
+    }
+    let mut contents = Vec::new();
+    file.take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut contents)
+        .map_err(|source| CliError::ReadTransferFile {
+            path: path.to_owned(),
+            source,
+        })?;
+    if contents.len() > max_bytes {
+        return Err(CliError::LocalTransferLimitExceeded { limit: max_bytes });
+    }
+    Ok(contents)
+}
+
+fn persist_new_local_file(path: &Path, contents: &[u8]) -> Result<(), CliError> {
+    if path.file_name().is_none() {
+        return Err(CliError::InvalidLocalDestination(path.to_owned()));
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(contents)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| match error.error.kind() {
+            io::ErrorKind::AlreadyExists => CliError::LocalDestinationExists(path.to_owned()),
+            _ => CliError::Io(error.error),
+        })?;
     Ok(())
 }
 
@@ -1595,6 +1826,20 @@ enum CliError {
     InsecureSecretPermissions(PathBuf),
     #[error("remote command exited with status {0}")]
     RemoteCommandExit(u32),
+    #[error("SFTP transfer limit must be greater than zero")]
+    InvalidTransferLimit,
+    #[error("local SFTP destination already exists: {0}")]
+    LocalDestinationExists(PathBuf),
+    #[error("local SFTP destination is invalid: {0}")]
+    InvalidLocalDestination(PathBuf),
+    #[error("local file exceeded the {limit}-byte transfer limit")]
+    LocalTransferLimitExceeded { limit: usize },
+    #[error("failed to read transfer file {path}: {source}")]
+    ReadTransferFile {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 #[cfg(test)]
@@ -1631,5 +1876,54 @@ mod tests {
             read_secret_file(&path, false),
             Err(CliError::InsecureSecretPermissions(found)) if found == path
         ));
+    }
+
+    #[test]
+    fn sftp_subcommands_parse_bounded_transfer_arguments() {
+        let host_id = HostId::new();
+        let cli = Cli::try_parse_from([
+            "yasc",
+            "sftp",
+            "download",
+            &host_id.to_string(),
+            "/remote/report.txt",
+            "report.txt",
+            "--identity",
+            "identity",
+            "--max-bytes",
+            "4096",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sftp {
+                command: SftpCommand::Download(SftpDownloadArgs {
+                    max_bytes: 4096,
+                    remote_path,
+                    ..
+                })
+            } if remote_path == "/remote/report.txt"
+        ));
+    }
+
+    #[test]
+    fn local_sftp_files_are_bounded_and_persisted_without_clobber() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::write(&source, b"0123456789").unwrap();
+        assert!(matches!(
+            read_bounded_local_file(&source, 5),
+            Err(CliError::LocalTransferLimitExceeded { limit: 5 })
+        ));
+        assert_eq!(read_bounded_local_file(&source, 10).unwrap(), b"0123456789");
+
+        let destination = directory.path().join("destination");
+        persist_new_local_file(&destination, b"first").unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"first");
+        assert!(matches!(
+            persist_new_local_file(&destination, b"second"),
+            Err(CliError::LocalDestinationExists(found)) if found == destination
+        ));
+        assert_eq!(fs::read(destination).unwrap(), b"first");
     }
 }
