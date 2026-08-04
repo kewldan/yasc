@@ -1225,16 +1225,30 @@ mod tests {
         let (output_writer, mut output_reader) = tokio::io::duplex(1024);
         let (error_writer, mut error_reader) = tokio::io::duplex(1024);
         let (size_sender, size_receiver) = watch::channel(initial_size);
-        let input_task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            input_writer.write_all(b"fixture input").await.unwrap();
-            input_writer.shutdown().await.unwrap();
-        });
-        let resize_task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        let driver_shell = Arc::clone(&shell);
+        let driver_task = tokio::spawn(async move {
+            loop {
+                if driver_shell.lock().unwrap().shell_requests == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
             size_sender
                 .send(TerminalSize::new(100, 40).unwrap())
                 .unwrap();
+            loop {
+                if driver_shell
+                    .lock()
+                    .unwrap()
+                    .window_changes
+                    .contains(&(100, 40))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            input_writer.write_all(b"fixture input").await.unwrap();
+            input_writer.shutdown().await.unwrap();
         });
 
         let result = timeout(
@@ -1249,8 +1263,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        input_task.await.unwrap();
-        resize_task.await.unwrap();
+        driver_task.await.unwrap();
         let mut stdout = Vec::new();
         output_reader.read_to_end(&mut stdout).await.unwrap();
         let mut stderr = Vec::new();
