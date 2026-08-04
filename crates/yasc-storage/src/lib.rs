@@ -7,16 +7,17 @@ use std::{collections::BTreeSet, path::Path, str::FromStr, time::Duration};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use thiserror::Error;
 use yasc_domain::{
-    Host, HostError, HostId, HostKeyAlgorithm, HostKeyError, HostKeyEvent, HostKeyEventId,
-    HostKeyEventKind, HostKeyFingerprint, HostKeyHistory, HostKeyId, HostKeyMaterial,
-    HostKeyRecord, HostKeyRecordState, HostKeySource, SshTarget, TargetParseError,
+    Credential, CredentialGrant, CredentialId, Host, HostError, HostId, HostKeyAlgorithm,
+    HostKeyError, HostKeyEvent, HostKeyEventId, HostKeyEventKind, HostKeyFingerprint,
+    HostKeyHistory, HostKeyId, HostKeyMaterial, HostKeyRecord, HostKeyRecordState, HostKeySource,
+    SshTarget, TargetParseError,
 };
 use yasc_vault::{
-    SecretKind, StoredSecretEnvelope, StoredVaultHeader, VaultKdfParams, VaultStore,
+    SecretKind, SecretRef, StoredSecretEnvelope, StoredVaultHeader, VaultKdfParams, VaultStore,
     VaultStoreError,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 struct Migration {
     version: u32,
@@ -137,7 +138,54 @@ const MIGRATIONS: &[Migration] = &[
                 ON host_key_events(host_id, occurred_at_unix, id);
         "#,
     },
+    Migration {
+        version: 5,
+        name: "credential_metadata_and_grants",
+        sql: r#"
+            CREATE TABLE credentials (
+                id                      TEXT PRIMARY KEY NOT NULL,
+                payload_json            TEXT NOT NULL,
+                created_at_unix         INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at_unix         INTEGER NOT NULL DEFAULT (unixepoch()),
+                deleted_at_unix         INTEGER
+            );
+
+            CREATE TABLE credential_secret_refs (
+                credential_id           TEXT NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+                kind                    INTEGER NOT NULL CHECK (kind BETWEEN 1 AND 255),
+                secret_id               TEXT NOT NULL REFERENCES vault_secrets(id),
+                PRIMARY KEY (credential_id, kind),
+                UNIQUE(secret_id)
+            );
+
+            CREATE TABLE credential_grants (
+                id                      TEXT PRIMARY KEY NOT NULL,
+                credential_id           TEXT NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+                payload_json            TEXT NOT NULL
+            );
+
+            CREATE INDEX credential_grants_credential_idx
+                ON credential_grants(credential_id, id);
+        "#,
+    },
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedCredential {
+    pub credential: Credential,
+    pub secret_refs: Vec<SecretRef>,
+    pub grants: Vec<CredentialGrant>,
+}
+
+impl PersistedCredential {
+    #[must_use]
+    pub fn secret(&self, kind: SecretKind) -> Option<SecretRef> {
+        self.secret_refs
+            .iter()
+            .copied()
+            .find(|reference| reference.kind == kind)
+    }
+}
 
 /// SQLite-backed local state. Secret material is owned by `yasc-vault`, not this repository.
 pub struct SqliteStorage {
@@ -428,6 +476,182 @@ impl SqliteStorage {
         stored
             .into_iter()
             .map(|host| self.restore_host(host))
+            .collect()
+    }
+
+    pub fn save_credential(
+        &mut self,
+        credential: &Credential,
+        secret_refs: &[SecretRef],
+        grants: &[CredentialGrant],
+    ) -> Result<(), StorageError> {
+        let mut secret_kinds = BTreeSet::new();
+        for reference in secret_refs {
+            if reference.credential_id != credential.id || !secret_kinds.insert(reference.kind) {
+                return Err(StorageError::InvalidCredentialBinding);
+            }
+            let stored = self
+                .load_secret_envelope(reference.id)
+                .map_err(|_| StorageError::InvalidCredentialBinding)?
+                .ok_or(StorageError::InvalidCredentialBinding)?;
+            if stored.credential_id != credential.id || stored.kind != reference.kind {
+                return Err(StorageError::InvalidCredentialBinding);
+            }
+        }
+        for grant in grants {
+            if grant.credential_id != credential.id
+                || grant.validate_against(&credential.capabilities).is_err()
+            {
+                return Err(StorageError::InvalidCredentialBinding);
+            }
+        }
+
+        let credential_json = serde_json::to_string(credential)?;
+        let grant_json = grants
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO credentials(id, payload_json) VALUES (?1, ?2)",
+            params![credential.id.to_string(), credential_json],
+        )?;
+        for reference in secret_refs {
+            transaction.execute(
+                r#"
+                    INSERT INTO credential_secret_refs(credential_id, kind, secret_id)
+                    VALUES (?1, ?2, ?3)
+                "#,
+                params![
+                    credential.id.to_string(),
+                    reference.kind.code(),
+                    reference.id.to_string(),
+                ],
+            )?;
+        }
+        for (grant, payload) in grants.iter().zip(grant_json) {
+            transaction.execute(
+                r#"
+                    INSERT INTO credential_grants(id, credential_id, payload_json)
+                    VALUES (?1, ?2, ?3)
+                "#,
+                params![grant.id.to_string(), credential.id.to_string(), payload],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn find_credential(
+        &self,
+        id: CredentialId,
+    ) -> Result<Option<PersistedCredential>, StorageError> {
+        let payload = self
+            .connection
+            .query_row(
+                r#"
+                    SELECT payload_json
+                    FROM credentials
+                    WHERE id = ?1 AND deleted_at_unix IS NULL
+                "#,
+                [id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let credential = serde_json::from_str::<Credential>(&payload)?;
+        if credential.id != id {
+            return Err(StorageError::InvalidCredentialBinding);
+        }
+
+        let mut secret_statement = self.connection.prepare(
+            r#"
+                SELECT kind, secret_id
+                FROM credential_secret_refs
+                WHERE credential_id = ?1
+                ORDER BY kind
+            "#,
+        )?;
+        let secret_refs = secret_statement
+            .query_map([id.to_string()], |row| {
+                let kind_code = row.get::<_, u8>(0)?;
+                let kind = SecretKind::from_code(kind_code).ok_or_else(|| {
+                    sql_conversion_error(
+                        0,
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "unknown credential secret kind",
+                        ),
+                    )
+                })?;
+                let secret_id = row
+                    .get::<_, String>(1)?
+                    .parse()
+                    .map_err(|error| sql_conversion_error(1, error))?;
+                Ok(SecretRef {
+                    id: secret_id,
+                    credential_id: id,
+                    kind,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut grant_statement = self.connection.prepare(
+            r#"
+                SELECT payload_json
+                FROM credential_grants
+                WHERE credential_id = ?1
+                ORDER BY id
+            "#,
+        )?;
+        let grant_payloads = grant_statement
+            .query_map([id.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let grants = grant_payloads
+            .into_iter()
+            .map(|payload| serde_json::from_str::<CredentialGrant>(&payload))
+            .collect::<Result<Vec<_>, _>>()?;
+        if grants.iter().any(|grant| {
+            grant.credential_id != id || grant.validate_against(&credential.capabilities).is_err()
+        }) {
+            return Err(StorageError::InvalidCredentialBinding);
+        }
+
+        Ok(Some(PersistedCredential {
+            credential,
+            secret_refs,
+            grants,
+        }))
+    }
+
+    pub fn list_credentials(&self) -> Result<Vec<PersistedCredential>, StorageError> {
+        let mut statement = self.connection.prepare(
+            r#"
+                SELECT id
+                FROM credentials
+                WHERE deleted_at_unix IS NULL
+                ORDER BY json_extract(payload_json, '$.label') COLLATE NOCASE, id
+            "#,
+        )?;
+        let ids = statement
+            .query_map([], |row| {
+                row.get::<_, String>(0)?
+                    .parse()
+                    .map(CredentialId::from_uuid)
+                    .map_err(|error| sql_conversion_error(0, error))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        ids.into_iter()
+            .map(|id| {
+                self.find_credential(id)?.ok_or_else(|| {
+                    StorageError::CorruptData("credential disappeared while listing".to_owned())
+                })
+            })
             .collect()
     }
 
@@ -931,6 +1155,8 @@ fn format_target(username: Option<&str>, hostname: &str, port: u16, port_explici
 pub enum StorageError {
     #[error("SQLite operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("stored JSON data is invalid: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("database schema version {found} is newer than supported version {supported}")]
     NewerSchema { found: u32, supported: u32 },
     #[error("stored data is invalid: {0}")]
@@ -943,12 +1169,17 @@ pub enum StorageError {
     InvalidHostKey(#[from] HostKeyError),
     #[error("host-key trust changed concurrently: {0}")]
     HostKeyConflict(String),
+    #[error("credential metadata, grant, and encrypted secret references do not agree")]
+    InvalidCredentialBinding,
 }
 
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
-    use yasc_domain::CredentialId;
+    use yasc_domain::{
+        CredentialCapabilities, CredentialGrant, CredentialProviderKind, CredentialUsage, Custody,
+        Synchronization,
+    };
     use yasc_vault::{
         EncryptedVault, SecretBytes, SecretKind, VaultBackend, VaultError, VaultState,
     };
@@ -1124,6 +1355,79 @@ mod tests {
             .unlock(SecretBytes::new(password.to_vec()))
             .unwrap();
         assert_eq!(reopened.read(reference).unwrap().expose_secret(), plaintext);
+    }
+
+    #[test]
+    fn credential_metadata_refs_and_host_grant_roundtrip() {
+        let mut storage = SqliteStorage::open_in_memory().unwrap();
+        let host = host("Production", "admin@example.com");
+        storage.save_host(&host).unwrap();
+        let credential = Credential::new(
+            "Production key",
+            CredentialProviderKind::LocalVault,
+            CredentialCapabilities::new(
+                Custody::Exportable,
+                Synchronization::LocalOnly,
+                [CredentialUsage::DirectSsh],
+            )
+            .unwrap(),
+        );
+        let password = b"test vault password";
+        let mut vault =
+            EncryptedVault::create(storage, SecretBytes::new(password.to_vec())).unwrap();
+        let key_ref = vault
+            .store(
+                credential.id,
+                SecretKind::SshPrivateKey,
+                SecretBytes::new(b"fixture private key".to_vec()),
+            )
+            .unwrap();
+        let grant =
+            CredentialGrant::new(credential.id, [host.id], [CredentialUsage::DirectSsh]).unwrap();
+        vault
+            .store_mut()
+            .save_credential(&credential, &[key_ref], std::slice::from_ref(&grant))
+            .unwrap();
+        let storage = vault.into_store();
+
+        let restored = storage.find_credential(credential.id).unwrap().unwrap();
+        assert_eq!(restored.credential, credential);
+        assert_eq!(restored.secret(SecretKind::SshPrivateKey), Some(key_ref));
+        assert_eq!(restored.grants, vec![grant]);
+        assert_eq!(storage.list_credentials().unwrap(), vec![restored]);
+    }
+
+    #[test]
+    fn credential_rejects_foreign_secret_reference() {
+        let storage = SqliteStorage::open_in_memory().unwrap();
+        let mut vault =
+            EncryptedVault::create(storage, SecretBytes::new(b"test vault password".to_vec()))
+                .unwrap();
+        let owner = CredentialId::new();
+        let key_ref = vault
+            .store(
+                owner,
+                SecretKind::SshPrivateKey,
+                SecretBytes::new(b"fixture private key".to_vec()),
+            )
+            .unwrap();
+        let credential = Credential::new(
+            "Other key",
+            CredentialProviderKind::LocalVault,
+            CredentialCapabilities::new(
+                Custody::Exportable,
+                Synchronization::LocalOnly,
+                [CredentialUsage::DirectSsh],
+            )
+            .unwrap(),
+        );
+
+        assert!(matches!(
+            vault
+                .store_mut()
+                .save_credential(&credential, &[key_ref], &[]),
+            Err(StorageError::InvalidCredentialBinding)
+        ));
     }
 
     #[test]

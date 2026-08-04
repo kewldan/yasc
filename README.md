@@ -78,11 +78,28 @@ cargo run -p yasc-cli -- --database ./yasc.db exec <HOST_ID> \
   --identity ~/.ssh/id_ed25519 'uname -a'
 ```
 
+Or initialize the encrypted vault, import a validated key with an explicit host grant, and select
+the resulting credential by its identifier:
+
+```bash
+chmod 600 ./vault-password ~/.ssh/id_ed25519
+cargo run -p yasc-cli -- --database ./yasc.db vault init \
+  --password-file ./vault-password
+cargo run -p yasc-cli -- --database ./yasc.db credential import-key "Production key" \
+  --host <HOST_ID> --key-file ~/.ssh/id_ed25519 \
+  --vault-password-file ./vault-password
+cargo run -p yasc-cli -- --database ./yasc.db credential list
+cargo run -p yasc-cli -- --database ./yasc.db exec <HOST_ID> \
+  --credential <CREDENTIAL_ID> --vault-password-file ./vault-password 'uname -a'
+```
+
 The native command path requires a username in the stored target, applies strict persistent
 host-key verification before authentication, rejects insecure key-file permissions on Unix, never
 accepts a passphrase on the command line, enforces a timeout and bounded output, and returns a
-non-successful CLI status when the remote command fails. This is a one-shot exec workflow; a native
-interactive PTY and local-vault credential selection are still in development.
+non-successful CLI status when the remote command fails. Vault imports validate the private key
+before encryption, store key passphrases as separate authenticated envelopes, and require a
+host-scoped direct-SSH grant before decryption. This is a one-shot exec workflow; native interactive
+PTY sessions and native-keystore unlock are still in development.
 
 The same format, lint, and test gates run on Linux, macOS, and Windows in GitHub Actions.
 

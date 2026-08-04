@@ -14,16 +14,18 @@ use base64::{Engine as _, engine::general_purpose};
 use clap::{Args, Parser, Subcommand};
 use thiserror::Error;
 use yasc_domain::{
-    Host, HostId, HostKeyAlgorithm, HostKeyDecision, HostKeyError, HostKeyFingerprint,
-    HostKeyMaterial, HostKeyObservation, HostKeyPolicy, HostKeySource, SshTarget,
+    Credential, CredentialCapabilities, CredentialGrant, CredentialId, CredentialProviderKind,
+    CredentialUsage, Custody, Host, HostId, HostKeyAlgorithm, HostKeyDecision, HostKeyError,
+    HostKeyFingerprint, HostKeyMaterial, HostKeyObservation, HostKeyPolicy, HostKeySource,
+    SshTarget, Synchronization,
 };
 use yasc_platform::{PlatformError, PlatformPaths};
 use yasc_ssh::{
     ConnectionPlan, HostKeyPolicy as OpenSshHostKeyPolicy, NativeCommandRequest, NativeSshEngine,
-    NativeSshError, OpenSshEngine, OpenSshError, OpenSshRequest, SshEngine,
+    NativeSshError, OpenSshEngine, OpenSshError, OpenSshRequest, SshEngine, validate_private_key,
 };
 use yasc_storage::{SqliteStorage, StorageError};
-use yasc_vault::SecretBytes;
+use yasc_vault::{EncryptedVault, SecretBytes, SecretKind, VaultBackend, VaultError};
 
 #[derive(Debug, Parser)]
 #[command(name = "yasc", version, about = "Yes Another SSH Client")]
@@ -53,6 +55,16 @@ enum Command {
         #[command(subcommand)]
         command: HostKeyCommand,
     },
+    /// Initialize the encrypted local vault.
+    Vault {
+        #[command(subcommand)]
+        command: VaultCommand,
+    },
+    /// Import and inspect encrypted SSH credentials.
+    Credential {
+        #[command(subcommand)]
+        command: CredentialCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -61,7 +73,13 @@ struct NativeExecArgs {
     host_id: HostId,
     /// Private key in an OpenSSH, PKCS#8, PEM, or supported PuTTY text format.
     #[arg(long, value_name = "PATH")]
-    identity: PathBuf,
+    identity: Option<PathBuf>,
+    /// Encrypted local-vault credential identifier.
+    #[arg(long, value_name = "ID")]
+    credential: Option<CredentialId>,
+    /// File containing the local vault password. Required with --credential.
+    #[arg(long, value_name = "PATH")]
+    vault_password_file: Option<PathBuf>,
     /// File containing the private-key passphrase. Trailing CR/LF bytes are removed.
     #[arg(long, value_name = "PATH")]
     passphrase_file: Option<PathBuf>,
@@ -74,6 +92,51 @@ struct NativeExecArgs {
     #[arg(long, default_value_t = 1_048_576)]
     max_output_bytes: usize,
     /// Print machine-readable JSON with base64-encoded output.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum VaultCommand {
+    /// Create the local encrypted vault.
+    Init(VaultInitArgs),
+}
+
+#[derive(Debug, Args)]
+struct VaultInitArgs {
+    /// File containing the vault password. Trailing CR/LF bytes are removed.
+    #[arg(long, value_name = "PATH")]
+    password_file: PathBuf,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum CredentialCommand {
+    /// Validate and encrypt a private key for explicitly selected hosts.
+    ImportKey(CredentialImportKeyArgs),
+    /// List credential metadata without unlocking the vault.
+    List(OutputArgs),
+}
+
+#[derive(Debug, Args)]
+struct CredentialImportKeyArgs {
+    /// Human-readable credential label.
+    label: String,
+    /// Host allowed to use this credential. May be repeated.
+    #[arg(long = "host", required = true, value_name = "HOST_ID")]
+    host_ids: Vec<HostId>,
+    /// Private key in an OpenSSH, PKCS#8, PEM, or supported PuTTY text format.
+    #[arg(long, value_name = "PATH")]
+    key_file: PathBuf,
+    /// File containing the private-key passphrase. It is encrypted separately.
+    #[arg(long, value_name = "PATH")]
+    key_passphrase_file: Option<PathBuf>,
+    /// File containing the local vault password.
+    #[arg(long, value_name = "PATH")]
+    vault_password_file: PathBuf,
+    /// Print machine-readable JSON.
     #[arg(long)]
     json: bool,
 }
@@ -384,8 +447,169 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Exec(args) => run_native_exec(cli.database, args).await?,
         Command::Host { command } => run_host_command(cli.database, command)?,
         Command::HostKey { command } => run_host_key_command(cli.database, command).await?,
+        Command::Vault { command } => run_vault_command(cli.database, command)?,
+        Command::Credential { command } => run_credential_command(cli.database, command)?,
     }
     Ok(())
+}
+
+fn run_vault_command(database: Option<PathBuf>, command: VaultCommand) -> Result<(), CliError> {
+    match command {
+        VaultCommand::Init(args) => {
+            let storage = open_storage(database)?;
+            let password = read_secret_file(&args.password_file, true)?;
+            let vault = EncryptedVault::create(storage, password)?;
+            drop(vault);
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "initialized": true,
+                    }))?
+                );
+            } else {
+                println!("Encrypted local vault initialized");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_credential_command(
+    database: Option<PathBuf>,
+    command: CredentialCommand,
+) -> Result<(), CliError> {
+    match command {
+        CredentialCommand::ImportKey(args) => import_key_credential(database, args)?,
+        CredentialCommand::List(args) => {
+            let storage = open_storage(database)?;
+            let credentials = storage.list_credentials()?;
+            if args.json {
+                let rows = credentials.iter().map(credential_json).collect::<Vec<_>>();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if credentials.is_empty() {
+                println!("No credentials");
+            } else {
+                for persisted in &credentials {
+                    println!(
+                        "{}  {}  local-vault  hosts:{}{}",
+                        persisted.credential.id,
+                        persisted.credential.label,
+                        persisted
+                            .grants
+                            .iter()
+                            .flat_map(|grant| grant.host_ids.iter())
+                            .collect::<BTreeSet<_>>()
+                            .len(),
+                        if persisted.secret(SecretKind::Passphrase).is_some() {
+                            "  passphrase:encrypted"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn import_key_credential(
+    database: Option<PathBuf>,
+    args: CredentialImportKeyArgs,
+) -> Result<(), CliError> {
+    if args.label.trim().is_empty() {
+        return Err(CliError::EmptyCredentialLabel);
+    }
+    let private_key = read_secret_file(&args.key_file, false)?;
+    let passphrase = args
+        .key_passphrase_file
+        .as_deref()
+        .map(|path| read_secret_file(path, true))
+        .transpose()?;
+    validate_private_key(&private_key, passphrase.as_ref())?;
+
+    let storage = open_storage(database)?;
+    for host_id in &args.host_ids {
+        if storage.find_host(*host_id)?.is_none() {
+            return Err(CliError::HostNotFound(*host_id));
+        }
+    }
+    let capabilities = CredentialCapabilities::new(
+        Custody::Exportable,
+        Synchronization::LocalOnly,
+        [CredentialUsage::DirectSsh],
+    )?;
+    let credential = Credential::new(
+        args.label.trim(),
+        CredentialProviderKind::LocalVault,
+        capabilities,
+    );
+    let grant = CredentialGrant::new(credential.id, args.host_ids, [CredentialUsage::DirectSsh])?;
+    let password = read_secret_file(&args.vault_password_file, true)?;
+    let mut vault = EncryptedVault::open(storage)?;
+    vault.unlock(password)?;
+    let key_ref = vault.store(credential.id, SecretKind::SshPrivateKey, private_key)?;
+    let passphrase_ref = match passphrase {
+        Some(passphrase) => match vault.store(credential.id, SecretKind::Passphrase, passphrase) {
+            Ok(reference) => Some(reference),
+            Err(error) => {
+                let _ = vault.remove(key_ref);
+                return Err(error.into());
+            }
+        },
+        None => None,
+    };
+    let mut secret_refs = vec![key_ref];
+    if let Some(reference) = passphrase_ref {
+        secret_refs.push(reference);
+    }
+    if let Err(error) =
+        vault
+            .store_mut()
+            .save_credential(&credential, &secret_refs, std::slice::from_ref(&grant))
+    {
+        for reference in secret_refs.into_iter().rev() {
+            let _ = vault.remove(reference);
+        }
+        return Err(error.into());
+    }
+    if args.json {
+        let persisted = yasc_storage::PersistedCredential {
+            credential,
+            secret_refs,
+            grants: vec![grant],
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&credential_json(&persisted))?
+        );
+    } else {
+        println!(
+            "Credential imported: {} ({})",
+            credential.label, credential.id
+        );
+    }
+    Ok(())
+}
+
+fn credential_json(persisted: &yasc_storage::PersistedCredential) -> serde_json::Value {
+    let host_ids = persisted
+        .grants
+        .iter()
+        .flat_map(|grant| grant.host_ids.iter())
+        .collect::<BTreeSet<_>>();
+    serde_json::json!({
+        "id": persisted.credential.id,
+        "label": persisted.credential.label,
+        "provider": persisted.credential.provider,
+        "custody": persisted.credential.capabilities.custody,
+        "synchronization": persisted.credential.capabilities.synchronization,
+        "allowed_usages": persisted.credential.capabilities.allowed_usages,
+        "host_ids": host_ids,
+        "has_private_key": persisted.secret(SecretKind::SshPrivateKey).is_some(),
+        "has_passphrase": persisted.secret(SecretKind::Passphrase).is_some(),
+    })
 }
 
 async fn run_native_exec(database: Option<PathBuf>, args: NativeExecArgs) -> Result<(), CliError> {
@@ -398,7 +622,62 @@ async fn run_native_exec(database: Option<PathBuf>, args: NativeExecArgs) -> Res
         .username()
         .ok_or(CliError::NativeUsernameRequired)?
         .to_owned();
-    let private_key = read_secret_file(&args.identity, false)?;
+    let history = storage.load_host_key_history(args.host_id)?;
+    let (private_key, passphrase) = match (args.identity.as_deref(), args.credential) {
+        (Some(identity), None) => {
+            if args.vault_password_file.is_some() {
+                return Err(CliError::InvalidCredentialSelection);
+            }
+            (
+                read_secret_file(identity, false)?,
+                args.passphrase_file
+                    .as_deref()
+                    .map(|path| read_secret_file(path, true))
+                    .transpose()?,
+            )
+        }
+        (None, Some(credential_id)) => {
+            if args.passphrase_file.is_some() {
+                return Err(CliError::InvalidCredentialSelection);
+            }
+            let persisted = storage
+                .find_credential(credential_id)?
+                .ok_or(CliError::CredentialNotFound(credential_id))?;
+            let now = unix_now()?;
+            if persisted.credential.provider != CredentialProviderKind::LocalVault
+                || !persisted
+                    .credential
+                    .capabilities
+                    .allows(CredentialUsage::DirectSsh)
+                || !persisted
+                    .grants
+                    .iter()
+                    .any(|grant| grant.authorizes(args.host_id, CredentialUsage::DirectSsh, now))
+            {
+                return Err(CliError::CredentialUnauthorized {
+                    credential_id,
+                    host_id: args.host_id,
+                });
+            }
+            let password_path = args
+                .vault_password_file
+                .as_deref()
+                .ok_or(CliError::VaultPasswordRequired)?;
+            let key_ref = persisted
+                .secret(SecretKind::SshPrivateKey)
+                .ok_or(CliError::CredentialPrivateKeyMissing(credential_id))?;
+            let passphrase_ref = persisted.secret(SecretKind::Passphrase);
+            let password = read_secret_file(password_path, true)?;
+            let mut vault = EncryptedVault::open(storage)?;
+            vault.unlock(password)?;
+            let private_key = vault.read(key_ref)?;
+            let passphrase = passphrase_ref
+                .map(|reference| vault.read(reference))
+                .transpose()?;
+            (private_key, passphrase)
+        }
+        _ => return Err(CliError::InvalidCredentialSelection),
+    };
     let mut request = NativeCommandRequest::new(
         host.target,
         username,
@@ -407,10 +686,9 @@ async fn run_native_exec(database: Option<PathBuf>, args: NativeExecArgs) -> Res
     )?
     .with_timeout(Duration::from_secs(args.timeout_seconds))?
     .with_max_output_bytes(args.max_output_bytes)?;
-    if let Some(path) = args.passphrase_file {
-        request = request.with_passphrase(read_secret_file(&path, true)?);
+    if let Some(passphrase) = passphrase {
+        request = request.with_passphrase(passphrase);
     }
-    let history = storage.load_host_key_history(args.host_id)?;
     let engine = NativeSshEngine::default();
     let output = engine
         .execute_command(request, &history, &HostKeyPolicy::strict())
@@ -772,6 +1050,12 @@ enum CliError {
     InvalidHost(#[from] yasc_domain::HostError),
     #[error(transparent)]
     HostKey(#[from] HostKeyError),
+    #[error(transparent)]
+    Vault(#[from] VaultError),
+    #[error(transparent)]
+    CredentialCapability(#[from] yasc_domain::CredentialCapabilityError),
+    #[error(transparent)]
+    CredentialGrant(#[from] yasc_domain::CredentialGrantError),
     #[error("host {0} was not found")]
     HostNotFound(HostId),
     #[error("host tags cannot be empty")]
@@ -786,6 +1070,23 @@ enum CliError {
     ClockOutOfRange,
     #[error("native SSH requires a username in the inventory target")]
     NativeUsernameRequired,
+    #[error("credential label cannot be empty")]
+    EmptyCredentialLabel,
+    #[error(
+        "choose exactly one of --identity or --credential; password options must match that choice"
+    )]
+    InvalidCredentialSelection,
+    #[error("credential {0} was not found")]
+    CredentialNotFound(CredentialId),
+    #[error("credential {credential_id} does not authorize direct SSH to host {host_id}")]
+    CredentialUnauthorized {
+        credential_id: CredentialId,
+        host_id: HostId,
+    },
+    #[error("credential {0} has no encrypted SSH private key")]
+    CredentialPrivateKeyMissing(CredentialId),
+    #[error("--vault-password-file is required with --credential")]
+    VaultPasswordRequired,
     #[error("failed to read secret file {path}: {source}")]
     ReadSecret {
         path: PathBuf,

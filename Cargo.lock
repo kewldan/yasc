@@ -2320,6 +2320,8 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "clap",
+ "rand",
+ "russh",
  "serde",
  "serde_json",
  "tempfile",
@@ -2369,6 +2371,7 @@ name = "yasc-storage"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
  "uuid",

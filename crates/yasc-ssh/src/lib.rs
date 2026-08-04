@@ -6,6 +6,7 @@ mod native;
 
 pub use native::{
     NativeCommandOutput, NativeCommandRequest, NativeHostKeyProbe, NativeSshEngine, NativeSshError,
+    validate_private_key,
 };
 
 use std::{

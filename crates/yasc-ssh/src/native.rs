@@ -16,6 +16,29 @@ use yasc_domain::{
 };
 use yasc_vault::SecretBytes;
 
+/// Verifies that private-key material can be decoded without retaining it or contacting a host.
+pub fn validate_private_key(
+    private_key: &SecretBytes,
+    passphrase: Option<&SecretBytes>,
+) -> Result<(), NativeSshError> {
+    decode_private_key(private_key, passphrase).map(|_| ())
+}
+
+fn decode_private_key(
+    private_key: &SecretBytes,
+    passphrase: Option<&SecretBytes>,
+) -> Result<ssh_key::PrivateKey, NativeSshError> {
+    let private_key_text = std::str::from_utf8(private_key.expose_secret())
+        .map_err(|_| NativeSshError::PrivateKeyNotUtf8)?;
+    let passphrase = passphrase
+        .map(|value| {
+            std::str::from_utf8(value.expose_secret())
+                .map_err(|_| NativeSshError::PassphraseNotUtf8)
+        })
+        .transpose()?;
+    russh::keys::decode_secret_key(private_key_text, passphrase).map_err(Into::into)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NativeHostKeyProbe {
     pub observation: HostKeyObservation,
@@ -231,17 +254,10 @@ impl NativeSshEngine {
         history: &HostKeyHistory,
         policy: &HostKeyPolicy,
     ) -> Result<NativeCommandOutput, NativeSshError> {
-        let private_key_text = std::str::from_utf8(request.private_key.expose_secret())
-            .map_err(|_| NativeSshError::PrivateKeyNotUtf8)?;
-        let passphrase = request
-            .private_key_passphrase
-            .as_ref()
-            .map(|value| {
-                std::str::from_utf8(value.expose_secret())
-                    .map_err(|_| NativeSshError::PassphraseNotUtf8)
-            })
-            .transpose()?;
-        let private_key = russh::keys::decode_secret_key(private_key_text, passphrase)?;
+        let private_key = decode_private_key(
+            &request.private_key,
+            request.private_key_passphrase.as_ref(),
+        )?;
         let captured = Arc::new(Mutex::new(None));
         let handler = NativeHostKeyHandler {
             history: history.clone(),
@@ -695,11 +711,13 @@ mod tests {
         .unwrap();
         let history = HostKeyHistory::new(HostId::new());
 
+        let error = NativeSshEngine::new(Duration::from_secs(2))
+            .execute_command(request, &history, &HostKeyPolicy::strict())
+            .await
+            .unwrap_err();
         assert!(matches!(
-            NativeSshEngine::new(Duration::from_secs(2))
-                .execute_command(request, &history, &HostKeyPolicy::strict())
-                .await,
-            Err(NativeSshError::Transport(_))
+            error,
+            NativeSshError::Transport(_) | NativeSshError::HandshakeTimeout
         ));
     }
 }

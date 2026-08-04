@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, fmt};
+use std::{collections::BTreeSet, fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -38,6 +38,14 @@ macro_rules! define_id {
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 self.0.fmt(formatter)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = uuid::Error;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Uuid::parse_str(value).map(Self)
             }
         }
     };
@@ -217,6 +225,17 @@ impl CredentialGrant {
         }
         Ok(())
     }
+
+    #[must_use]
+    pub fn authorizes(&self, host_id: crate::HostId, usage: CredentialUsage, at_unix: i64) -> bool {
+        self.host_ids.contains(&host_id)
+            && self.usages.contains(&usage)
+            && self
+                .expires_at_unix
+                .is_none_or(|expires_at| at_unix < expires_at)
+            && !self.requires_approval
+            && !self.requires_step_up
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -278,5 +297,20 @@ mod tests {
                 CredentialUsage::Automation
             ))
         );
+    }
+
+    #[test]
+    fn grant_denies_expired_or_interactive_authorization_requirements() {
+        let host_id = crate::HostId::new();
+        let credential_id = CredentialId::new();
+        let mut grant =
+            CredentialGrant::new(credential_id, [host_id], [CredentialUsage::DirectSsh]).unwrap();
+
+        assert!(grant.authorizes(host_id, CredentialUsage::DirectSsh, 9));
+        grant.expires_at_unix = Some(10);
+        assert!(!grant.authorizes(host_id, CredentialUsage::DirectSsh, 10));
+        grant.expires_at_unix = None;
+        grant.requires_approval = true;
+        assert!(!grant.authorizes(host_id, CredentialUsage::DirectSsh, 9));
     }
 }

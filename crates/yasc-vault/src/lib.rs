@@ -57,7 +57,7 @@ pub enum VaultState {
     Unlocked,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SecretKind {
     SshPrivateKey,
     Password,
@@ -251,6 +251,11 @@ impl<S: VaultStore> EncryptedVault<S> {
     #[must_use]
     pub fn into_store(self) -> S {
         self.store
+    }
+
+    #[must_use]
+    pub fn store_mut(&mut self) -> &mut S {
+        &mut self.store
     }
 
     fn unlocked_key(&self) -> Result<&SecretBytes, VaultError> {
